@@ -72,11 +72,12 @@ pub fn render_plan_table(plan: &ValidatedPlan) -> Table {
                 Some(Color::Red)
             }
             EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => Some(Color::Yellow),
-            EffectiveActionKind::CreateDir => Some(Color::Green),
+            EffectiveActionKind::CreateDir | EffectiveActionKind::CreateFile => Some(Color::Green),
         };
 
         let label = match action.effective_kind {
             EffectiveActionKind::CreateDir => "create_dir",
+            EffectiveActionKind::CreateFile => "create_file",
             EffectiveActionKind::MoveFile => "move_file",
             EffectiveActionKind::RenamePath => "rename_path",
             EffectiveActionKind::DeleteToTrash => "delete_to_trash",

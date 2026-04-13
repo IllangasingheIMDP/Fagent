@@ -47,6 +47,13 @@ impl Executor {
                     self.create_dir(action.destination.as_ref().expect("validated"))
                         .await
                 }
+                EffectiveActionKind::CreateFile => {
+                    self.create_file(
+                        action.destination.as_ref().expect("validated"),
+                        action.content.as_deref().expect("validated"),
+                    )
+                    .await
+                }
                 EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => {
                     self.move_path(
                         action.source.as_ref().expect("validated"),
@@ -91,6 +98,14 @@ impl Executor {
 
     async fn create_dir(&self, destination: &Path) -> Result<()> {
         fs::create_dir_all(destination).await?;
+        Ok(())
+    }
+
+    async fn create_file(&self, destination: &Path, content: &str) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(destination, content).await?;
         Ok(())
     }
 
@@ -220,6 +235,7 @@ mod tests {
                 effective_kind: EffectiveActionKind::MoveFile,
                 source: Some(source),
                 destination: Some(destination.clone()),
+                content: None,
                 display_source: Some("note.txt".into()),
                 display_destination: Some("archive/note.txt".into()),
                 rationale: None,
@@ -248,6 +264,7 @@ mod tests {
                     effective_kind: EffectiveActionKind::DeletePermanent,
                     source: Some(workspace.join("missing.txt")),
                     destination: None,
+                    content: None,
                     display_source: Some("missing.txt".into()),
                     display_destination: None,
                     rationale: None,
@@ -258,6 +275,7 @@ mod tests {
                     effective_kind: EffectiveActionKind::CreateDir,
                     source: None,
                     destination: Some(workspace.join("later")),
+                    content: None,
                     display_source: None,
                     display_destination: Some("later".into()),
                     rationale: None,
@@ -269,5 +287,35 @@ mod tests {
         assert!(!report.succeeded());
         assert_eq!(report.pending, vec!["2"]);
         assert!(!workspace.join("later").exists());
+    }
+
+    #[tokio::test]
+    async fn create_file_writes_content() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+        let destination = workspace.join("scripts").join("hello.bat");
+        let content = "@echo off\r\necho hello\r\n";
+        let plan = ValidatedPlan {
+            workspace_root: workspace.clone(),
+            warnings: vec![],
+            actions: vec![ValidatedAction {
+                id: "1".into(),
+                kind: ActionKind::CreateFile,
+                effective_kind: EffectiveActionKind::CreateFile,
+                source: None,
+                destination: Some(destination.clone()),
+                content: Some(content.into()),
+                display_source: None,
+                display_destination: Some("scripts/hello.bat".into()),
+                rationale: None,
+            }],
+        };
+
+        let report = executor.run(&plan).await;
+        assert!(report.succeeded());
+        assert_eq!(fs::read_to_string(destination).unwrap(), content);
     }
 }

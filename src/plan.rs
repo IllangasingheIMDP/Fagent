@@ -10,10 +10,10 @@ use crate::{FagentError, Result};
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
     CreateDir,
+    CreateFile,
     MoveFile,
     RenamePath,
     DeletePath,
-    
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,8 @@ pub struct PlannedAction {
     pub source: Option<String>,
     #[serde(default)]
     pub destination: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub rationale: Option<String>,
 }
@@ -42,6 +44,7 @@ pub struct ExecutionPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectiveActionKind {
     CreateDir,
+    CreateFile,
     MoveFile,
     RenamePath,
     DeleteToTrash,
@@ -55,6 +58,7 @@ pub struct ValidatedAction {
     pub effective_kind: EffectiveActionKind,
     pub source: Option<PathBuf>,
     pub destination: Option<PathBuf>,
+    pub content: Option<String>,
     pub display_source: Option<String>,
     pub display_destination: Option<String>,
     pub rationale: Option<String>,
@@ -91,6 +95,7 @@ pub fn validate_plan(plan: ExecutionPlan, policy: &WorkspacePolicy) -> Result<Va
     for action in plan.actions {
         let validated = match action.kind {
             ActionKind::CreateDir => validate_create_dir(action, policy, &mut available)?,
+            ActionKind::CreateFile => validate_create_file(action, policy, &mut available)?,
             ActionKind::MoveFile => validate_move_like(
                 action,
                 policy,
@@ -141,6 +146,38 @@ fn validate_create_dir(
         effective_kind: EffectiveActionKind::CreateDir,
         source: None,
         destination: Some(destination.clone()),
+        content: None,
+        display_source: None,
+        display_destination: Some(policy.display_path(&destination)),
+        rationale: action.rationale,
+    })
+}
+
+fn validate_create_file(
+    action: PlannedAction,
+    policy: &WorkspacePolicy,
+    available: &mut HashSet<String>,
+) -> Result<ValidatedAction> {
+    let destination_raw = require_destination(&action)?;
+    let content = require_content(&action)?.to_string();
+    let destination = policy.resolve_path(destination_raw)?;
+    let destination_key = policy.path_key(&destination);
+
+    if destination.exists() || available.contains(&destination_key) {
+        return Err(FagentError::Validation(format!(
+            "create_file target already exists or is claimed by an earlier action: {destination_raw}"
+        )));
+    }
+
+    available.insert(destination_key);
+
+    Ok(ValidatedAction {
+        id: action.id,
+        kind: action.kind,
+        effective_kind: EffectiveActionKind::CreateFile,
+        source: None,
+        destination: Some(destination.clone()),
+        content: Some(content),
         display_source: None,
         display_destination: Some(policy.display_path(&destination)),
         rationale: action.rationale,
@@ -184,6 +221,7 @@ fn validate_move_like(
         effective_kind,
         source: Some(source.clone()),
         destination: Some(destination.clone()),
+        content: None,
         display_source: Some(policy.display_path(&source)),
         display_destination: Some(policy.display_path(&destination)),
         rationale: action.rationale,
@@ -214,6 +252,7 @@ fn validate_delete(
         },
         source: Some(source.clone()),
         destination: None,
+        content: None,
         display_source: Some(policy.display_path(&source)),
         display_destination: None,
         rationale: action.rationale,
@@ -255,6 +294,13 @@ fn require_destination(action: &PlannedAction) -> Result<&str> {
     })
 }
 
+fn require_content(action: &PlannedAction) -> Result<&str> {
+    action
+        .content
+        .as_deref()
+        .ok_or_else(|| FagentError::Validation(format!("action `{}` is missing content", action.id)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -282,6 +328,7 @@ mod tests {
                     kind: ActionKind::MoveFile,
                     source: Some("a.txt".into()),
                     destination: Some("out.txt".into()),
+                    content: None,
                     rationale: None,
                 },
                 PlannedAction {
@@ -289,6 +336,7 @@ mod tests {
                     kind: ActionKind::MoveFile,
                     source: Some("b.txt".into()),
                     destination: Some("out.txt".into()),
+                    content: None,
                     rationale: None,
                 },
             ],
@@ -315,6 +363,7 @@ mod tests {
                     kind: ActionKind::DeletePath,
                     source: Some("a.txt".into()),
                     destination: None,
+                    content: None,
                     rationale: None,
                 },
                 PlannedAction {
@@ -322,6 +371,7 @@ mod tests {
                     kind: ActionKind::RenamePath,
                     source: Some("a.txt".into()),
                     destination: Some("b.txt".into()),
+                    content: None,
                     rationale: None,
                 },
             ],
@@ -329,5 +379,63 @@ mod tests {
 
         let result = validate_plan(plan, &policy);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_file_requires_content() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = WorkspacePolicy::new(workspace, false, false).unwrap();
+
+        let plan = ExecutionPlan {
+            workspace_root: None,
+            warnings: vec![],
+            actions: vec![PlannedAction {
+                id: "1".into(),
+                kind: ActionKind::CreateFile,
+                source: None,
+                destination: Some("notes.txt".into()),
+                content: None,
+                rationale: None,
+            }],
+        };
+
+        let result = validate_plan(plan, &policy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_file_can_be_moved_later_in_plan() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = WorkspacePolicy::new(workspace, false, false).unwrap();
+
+        let plan = ExecutionPlan {
+            workspace_root: None,
+            warnings: vec![],
+            actions: vec![
+                PlannedAction {
+                    id: "1".into(),
+                    kind: ActionKind::CreateFile,
+                    source: None,
+                    destination: Some("script.bat".into()),
+                    content: Some("@echo off\r\necho hi\r\n".into()),
+                    rationale: None,
+                },
+                PlannedAction {
+                    id: "2".into(),
+                    kind: ActionKind::RenamePath,
+                    source: Some("script.bat".into()),
+                    destination: Some("archive/script.bat".into()),
+                    content: None,
+                    rationale: None,
+                },
+            ],
+        };
+
+        let result = validate_plan(plan, &policy);
+        assert!(result.is_ok());
     }
 }

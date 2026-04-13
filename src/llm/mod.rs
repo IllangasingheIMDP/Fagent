@@ -88,9 +88,10 @@ Return only valid JSON matching this schema:
   "actions": [
     {
       "id": "string",
-      "kind": "create_dir | move_file | rename_path | delete_path",
+            "kind": "create_dir | create_file | move_file | rename_path | delete_path",
       "source": "string or null",
       "destination": "string or null",
+            "content": "string or null",
       "rationale": "string or null"
     }
   ]
@@ -100,6 +101,7 @@ Rules:
 - Prefer relative paths within the provided workspace.
 - Do not invent files that are not present in the workspace context.
 - Use delete_path only when the instruction clearly asks for deletion.
+- Use create_file to create text files (for example .txt, .bat, .md, .json, .rs) and always include a content string (empty string is allowed).
 - Include create_dir before writing into a new directory when that makes the plan clearer.
 - Keep the action list minimal and sequential.
 - Never include explanations outside the JSON payload."#
