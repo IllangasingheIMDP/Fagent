@@ -161,6 +161,33 @@ pub fn extract_text_from_content_array(value: &serde_json::Value) -> Option<Stri
     })
 }
 
+pub(crate) fn map_http_error(stage: &str, error: reqwest::Error) -> FagentError {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_status() {
+        "status"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "http"
+    };
+
+    let status = error
+        .status()
+        .map(|code| code.as_u16().to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+
+    FagentError::Provider(format!(
+        "{stage} failed (category={category}, status={status})"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plan::ActionKind;

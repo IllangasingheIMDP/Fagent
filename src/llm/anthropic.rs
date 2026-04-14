@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::llm::{
     LlmProvider, PlanRequest, compose_user_prompt, extract_text_from_content_array,
-    parse_plan_response, system_prompt,
+    map_http_error, parse_plan_response, system_prompt,
 };
 use crate::plan::ExecutionPlan;
 use crate::{FagentError, Result};
@@ -44,9 +44,14 @@ impl LlmProvider for AnthropicProvider {
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
-        let value: serde_json::Value = response.json().await?;
+            .await
+            .map_err(|error| map_http_error("Anthropic request", error))?
+            .error_for_status()
+            .map_err(|error| map_http_error("Anthropic response status", error))?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| map_http_error("Anthropic response decode", error))?;
         let content = extract_text_from_content_array(value.get("content").ok_or_else(|| {
             FagentError::Provider("Anthropic response did not include content".into())
         })?)

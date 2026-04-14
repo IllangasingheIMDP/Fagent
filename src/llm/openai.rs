@@ -3,7 +3,8 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::llm::{
-    LlmProvider, PlanRequest, compose_user_prompt, parse_plan_response, system_prompt,
+    LlmProvider, PlanRequest, compose_user_prompt, map_http_error, parse_plan_response,
+    system_prompt,
 };
 use crate::plan::ExecutionPlan;
 use crate::{FagentError, Result};
@@ -42,9 +43,14 @@ impl LlmProvider for OpenAiProvider {
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
-        let value: serde_json::Value = response.json().await?;
+            .await
+            .map_err(|error| map_http_error("OpenAI request", error))?
+            .error_for_status()
+            .map_err(|error| map_http_error("OpenAI response status", error))?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| map_http_error("OpenAI response decode", error))?;
         let content = value
             .get("choices")
             .and_then(|choices| choices.get(0))

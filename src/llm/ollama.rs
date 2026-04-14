@@ -3,7 +3,8 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::llm::{
-    LlmProvider, PlanRequest, compose_user_prompt, parse_plan_response, system_prompt,
+    LlmProvider, PlanRequest, compose_user_prompt, map_http_error, parse_plan_response,
+    system_prompt,
 };
 use crate::plan::ExecutionPlan;
 use crate::{FagentError, Result};
@@ -42,9 +43,14 @@ impl LlmProvider for OllamaProvider {
             .post(endpoint)
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
-        let value: serde_json::Value = response.json().await?;
+            .await
+            .map_err(|error| map_http_error("Ollama request", error))?
+            .error_for_status()
+            .map_err(|error| map_http_error("Ollama response status", error))?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| map_http_error("Ollama response decode", error))?;
         let content = value
             .get("message")
             .and_then(|message| message.get("content"))

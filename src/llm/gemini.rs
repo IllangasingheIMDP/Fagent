@@ -4,7 +4,8 @@ use serde_json::json;
 use tracing::info;
 
 use crate::llm::{
-    LlmProvider, PlanRequest, compose_user_prompt, parse_plan_response, system_prompt,
+    LlmProvider, PlanRequest, compose_user_prompt, map_http_error, parse_plan_response,
+    system_prompt,
 };
 use crate::plan::ExecutionPlan;
 use crate::{FagentError, Result};
@@ -28,11 +29,7 @@ impl GeminiProvider {
 impl LlmProvider for GeminiProvider {
     async fn plan(&self, request: &PlanRequest) -> Result<ExecutionPlan> {
         let endpoint = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            request.model, self.api_key
-        );
-        let redacted_endpoint = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key=<redacted>",
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             request.model
         );
         let payload = json!({
@@ -49,17 +46,23 @@ impl LlmProvider for GeminiProvider {
             }
         });
 
-        info!(model = %request.model, endpoint = %redacted_endpoint, "sending Gemini request");
+        info!(model = %request.model, endpoint = %endpoint, "sending Gemini request");
         info!(payload = %payload, "Gemini request payload");
 
         let response = self
             .client
-            .post(endpoint)
+            .post(&endpoint)
+            .header("x-goog-api-key", &self.api_key)
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
-        let value: serde_json::Value = response.json().await?;
+            .await
+            .map_err(|error| map_http_error("Gemini request", error))?
+            .error_for_status()
+            .map_err(|error| map_http_error("Gemini response status", error))?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| map_http_error("Gemini response decode", error))?;
         info!(response = %value, "Gemini raw response");
         let content = value
             .get("candidates")
