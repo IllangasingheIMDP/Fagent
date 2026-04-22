@@ -33,6 +33,7 @@ pub fn review_plan(plan: &ValidatedPlan, instruction: &str) -> Result<ReviewChoi
     }
 
     println!("{}", render_plan_table(plan));
+    print_action_warnings(plan);
     let options = vec![
         MenuOption("Approve"),
         MenuOption("Cancel"),
@@ -49,7 +50,13 @@ pub fn review_plan(plan: &ValidatedPlan, instruction: &str) -> Result<ReviewChoi
     };
 
     match choice.0 {
-        "Approve" => Ok(ReviewChoice::Approve),
+        "Approve" => {
+            if confirm_risky_deletes(plan)? {
+                Ok(ReviewChoice::Approve)
+            } else {
+                Ok(ReviewChoice::Cancel)
+            }
+        }
         "Cancel" => Ok(ReviewChoice::Cancel),
         "Edit instruction" => {
             let new_instruction = Text::new("Update the instruction:")
@@ -72,6 +79,7 @@ pub fn render_plan_table(plan: &ValidatedPlan) -> Table {
                 Some(Color::Red)
             }
             EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => Some(Color::Yellow),
+            EffectiveActionKind::ZipPath | EffectiveActionKind::UnzipArchive => Some(Color::Blue),
             EffectiveActionKind::CreateDir | EffectiveActionKind::CreateFile => Some(Color::Green),
         };
 
@@ -80,6 +88,8 @@ pub fn render_plan_table(plan: &ValidatedPlan) -> Table {
             EffectiveActionKind::CreateFile => "create_file",
             EffectiveActionKind::MoveFile => "move_file",
             EffectiveActionKind::RenamePath => "rename_path",
+            EffectiveActionKind::ZipPath => "zip_path",
+            EffectiveActionKind::UnzipArchive => "unzip_archive",
             EffectiveActionKind::DeleteToTrash => "delete_to_trash",
             EffectiveActionKind::DeletePermanent => "delete_permanent",
         };
@@ -99,6 +109,46 @@ pub fn render_plan_table(plan: &ValidatedPlan) -> Table {
     }
 
     table
+}
+
+fn print_action_warnings(plan: &ValidatedPlan) {
+    let warnings = plan
+        .actions
+        .iter()
+        .flat_map(|action| action.warnings.iter());
+
+    let mut printed_any = false;
+    for warning in warnings {
+        if !printed_any {
+            println!();
+            printed_any = true;
+        }
+        println!("warning: {warning}");
+    }
+
+    if printed_any {
+        println!();
+    }
+}
+
+fn confirm_risky_deletes(plan: &ValidatedPlan) -> Result<bool> {
+    if !plan
+        .actions
+        .iter()
+        .any(|action| !action.warnings.is_empty())
+    {
+        return Ok(true);
+    }
+
+    let confirmation =
+        match Text::new("Type DELETE to continue with the high-risk delete actions:").prompt() {
+            Ok(value) => value,
+            Err(inquire::error::InquireError::OperationCanceled)
+            | Err(inquire::error::InquireError::OperationInterrupted) => return Ok(false),
+            Err(error) => return Err(FagentError::from(error)),
+        };
+
+    Ok(confirmation == "DELETE")
 }
 
 pub fn print_execution_report(report: &crate::executor::ExecutionReport) {

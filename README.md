@@ -15,6 +15,8 @@ Current action kinds:
 - `create_file` (text file with explicit content)
 - `move_file`
 - `rename_path`
+- `zip_path` (create a `.zip` archive from a file or directory)
+- `unzip_archive` (extract a `.zip` file into a destination directory)
 - `delete_path` (to trash by default, permanent with flag)
 
 Typical use cases:
@@ -48,6 +50,9 @@ Typical use cases:
 - Deletion behavior:
 	- default: route deletes to OS trash/recycle bin
 	- `--permanent-delete`: permanently remove files/directories
+	- workspace-root deletion is blocked
+	- repository metadata directories such as `.git` are protected from deletion
+	- risky deletes (permanent, recursive directory, outside-workspace) require extra confirmation
 
 ## Supported Providers
 
@@ -221,4 +226,3 @@ Contributions are welcome. Please open an issue or PR with:
 ## License
 
 No license file is currently included in this repository. 
-

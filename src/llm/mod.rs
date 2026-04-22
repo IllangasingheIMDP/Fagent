@@ -88,7 +88,7 @@ Return only valid JSON matching this schema:
   "actions": [
     {
       "id": "string",
-            "kind": "create_dir | create_file | move_file | rename_path | delete_path",
+            "kind": "create_dir | create_file | move_file | rename_path | zip_path | unzip_archive | delete_path",
       "source": "string or null",
       "destination": "string or null",
             "content": "string or null",
@@ -101,9 +101,14 @@ Rules:
 - Prefer relative paths within the provided workspace.
 - Do not invent files that are not present in the workspace context.
 - Use delete_path only when the instruction clearly asks for deletion.
+- Never delete the workspace root.
+- Never delete repository metadata directories such as .git, .hg, .svn, or .jj.
+- Avoid deleting hidden or security-sensitive paths unless the instruction explicitly names them.
 - For delete_path, always set source to the file or directory path to delete, and set destination to null.
 - For rename_path, always set both source and destination (source is old path, destination is new path).
 - For move_file, always set both source and destination, and source must refer to a file path.
+- For zip_path, always set source (file or directory to archive) and destination (zip file path).
+- For unzip_archive, always set source (zip file path) and destination (directory where files should be extracted).
 - Use create_file to create text files (for example .txt, .bat, .md, .json, .rs) and always include a content string (empty string is allowed).
 - Include create_dir before writing into a new directory when that makes the plan clearer.
 - Keep the action list minimal and sequential.

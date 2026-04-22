@@ -25,6 +25,14 @@ impl WorkspacePolicy {
         &self.root
     }
 
+    pub fn is_within_workspace(&self, path: &Path) -> bool {
+        path_starts_with(path, &self.canonical_root)
+    }
+
+    pub fn is_workspace_root(&self, path: &Path) -> bool {
+        path == self.canonical_root
+    }
+
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
         if raw.trim().is_empty() {
             return Err(FagentError::Validation("paths cannot be empty".into()));

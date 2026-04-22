@@ -3,8 +3,8 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::llm::{
-    LlmProvider, PlanRequest, compose_user_prompt, extract_text_from_content_array,
-    map_http_error, parse_plan_response, system_prompt,
+    LlmProvider, PlanRequest, compose_user_prompt, extract_text_from_content_array, map_http_error,
+    parse_plan_response, system_prompt,
 };
 use crate::plan::ExecutionPlan;
 use crate::{FagentError, Result};
