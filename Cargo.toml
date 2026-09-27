@@ -34,3 +34,11 @@ keyring = { version = "3.6", features = ["linux-native"] }
 
 [dev-dependencies]
 tempfile = "3.15"
+
+[profile.release]
+opt-level = "z"       # Optimize for size (use 's' or 3 if raw performance is preferred)
+lto = true            # Enable Link Time Optimization across all crates
+codegen-units = 1     # Reduce parallel code generation units to maximize LTO
+panic = "abort"       # Remove panic unwinding overhead
+strip = true          # Automatically strip symbols and debug info
+
