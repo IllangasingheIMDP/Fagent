@@ -1,6 +1,13 @@
+use std::path::Path;
+
 use comfy_table::{Color, Table, presets::UTF8_FULL};
 use inquire::{Select, Text};
 
+use crate::executor::{
+    ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision,
+    RollbackActionReport, RollbackFailureDecision, RollbackReport, RollbackStatus,
+    is_file_locked_error,
+};
 use crate::plan::{EffectiveActionKind, ValidatedPlan};
 use crate::{FagentError, Result};
 
@@ -154,6 +161,8 @@ fn confirm_risky_deletes(plan: &ValidatedPlan) -> Result<bool> {
 pub fn print_execution_report(report: &crate::executor::ExecutionReport) {
     if report.succeeded() {
         println!("\nExecution completed successfully.");
+    } else if report.rollback.is_some() {
+        println!("\nExecution stopped and completed actions were rolled back.");
     } else {
         println!("\nExecution stopped after a failure.");
     }
@@ -168,5 +177,190 @@ pub fn print_execution_report(report: &crate::executor::ExecutionReport) {
 
     if !report.pending.is_empty() {
         println!("Pending: {}", report.pending.join(", "));
+    }
+
+    if report.retries > 0 {
+        println!("Retries: {}", report.retries);
+    }
+}
+
+pub fn print_rollback_summary(report: &RollbackReport) {
+    println!("\nRollback Summary:");
+    let succeeded = report
+        .rolled_back
+        .iter()
+        .filter(|r| matches!(r.status, RollbackStatus::Success(_)))
+        .count();
+    let skipped = report
+        .rolled_back
+        .iter()
+        .filter(|r| matches!(r.status, RollbackStatus::Skipped(_)))
+        .count();
+    let failed = report
+        .rolled_back
+        .iter()
+        .filter(|r| matches!(r.status, RollbackStatus::Failed(_)))
+        .count();
+
+    println!("  Total actions considered: {}", report.rolled_back.len());
+    println!("  Successfully restored:    {succeeded}");
+    if skipped > 0 {
+        println!("  Skipped (e.g. permanent): {skipped}");
+    }
+    if failed > 0 {
+        println!("  Failed:                   {failed}");
+    }
+    if report.success {
+        println!("All reversible actions were successfully rolled back.");
+    } else {
+        println!("Some actions could not be rolled back.");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostFailureChoice {
+    Edit(String),
+    Exit,
+}
+
+pub fn prompt_post_failure_action(current_instruction: &str) -> Result<PostFailureChoice> {
+    println!("\nExecution did not complete.");
+    let options = vec![
+        "Edit instruction and re-plan",
+        "Exit",
+    ];
+    let choice = match Select::new("What would you like to do next?", options).prompt() {
+        Ok(c) => c,
+        Err(inquire::error::InquireError::OperationCanceled)
+        | Err(inquire::error::InquireError::OperationInterrupted) => {
+            return Ok(PostFailureChoice::Exit);
+        }
+        Err(err) => return Err(FagentError::from(err)),
+    };
+
+    match choice {
+        choice if choice.starts_with("Edit instruction") => {
+            let new_instruction = Text::new("Update the instruction:")
+                .with_initial_value(current_instruction)
+                .prompt()?;
+            Ok(PostFailureChoice::Edit(new_instruction))
+        }
+        _ => Ok(PostFailureChoice::Exit),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InteractiveRecoveryHandler;
+
+impl ExecutionRecoveryHandler for InteractiveRecoveryHandler {
+    fn on_action_failure(&self, context: &ExecutionFailureContext) -> Result<RecoveryDecision> {
+        let action_desc = format_action_summary(
+            &context.effective_kind,
+            context.source.as_deref(),
+            context.destination.as_deref(),
+        );
+
+        println!(
+            "\n❌ Execution failed on action '{}' ({})",
+            context.action_id, action_desc
+        );
+        println!("Error: {}\n", context.error);
+
+        if is_file_locked_error(&context.error) {
+            println!("💡 File Lock Detected: The file appears to be in use by another process.");
+            println!("   Please close applications using this file (or terminate the process in Task Manager),");
+            println!("   then choose 'Try again'.\n");
+        }
+
+        let mut options = vec!["Try again (retry from the failed action)"];
+        if context.completed_actions_count > 0 {
+            options.push("Roll back (undo completed actions in reverse order)");
+        }
+        options.push("Abort (stop execution without rollback)");
+
+        let choice = match Select::new("How would you like to handle this failure?", options).prompt() {
+            Ok(c) => c,
+            Err(inquire::error::InquireError::OperationCanceled)
+            | Err(inquire::error::InquireError::OperationInterrupted) => {
+                return Ok(RecoveryDecision::Abort);
+            }
+            Err(err) => return Err(FagentError::from(err)),
+        };
+
+        match choice {
+            c if c.starts_with("Try again") => Ok(RecoveryDecision::Retry),
+            c if c.starts_with("Roll back") => Ok(RecoveryDecision::Rollback),
+            _ => Ok(RecoveryDecision::Abort),
+        }
+    }
+
+    fn on_rollback_step(&self, report: &RollbackActionReport) {
+        match &report.status {
+            RollbackStatus::Success(msg) => {
+                println!("  ✓ Rolled back [{}]: {}", report.action_id, msg);
+            }
+            RollbackStatus::Skipped(msg) => {
+                println!("  ⚠ Skipped [{}]: {}", report.action_id, msg);
+            }
+            RollbackStatus::Failed(msg) => {
+                println!("  ✗ Failed to roll back [{}]: {}", report.action_id, msg);
+            }
+        }
+    }
+
+    fn on_rollback_failure(
+        &self,
+        action_id: &str,
+        error: &str,
+    ) -> Result<RollbackFailureDecision> {
+        println!("\n❌ Failed to roll back action '{action_id}': {error}");
+        if is_file_locked_error(error) {
+            println!("💡 Notice: The file appears to be locked by another process.");
+        }
+
+        let options = vec![
+            "Try again (retry rollback of this action)",
+            "Skip (skip this action and continue rolling back remaining actions)",
+            "Abort (stop rollback here)",
+        ];
+
+        let choice = match Select::new("What would you like to do?", options).prompt() {
+            Ok(c) => c,
+            Err(inquire::error::InquireError::OperationCanceled)
+            | Err(inquire::error::InquireError::OperationInterrupted) => {
+                return Ok(RollbackFailureDecision::Skip);
+            }
+            Err(err) => return Err(FagentError::from(err)),
+        };
+
+        match choice {
+            c if c.starts_with("Try again") => Ok(RollbackFailureDecision::Retry),
+            c if c.starts_with("Skip") => Ok(RollbackFailureDecision::Skip),
+            _ => Ok(RollbackFailureDecision::Abort),
+        }
+    }
+}
+
+fn format_action_summary(
+    kind: &EffectiveActionKind,
+    source: Option<&Path>,
+    destination: Option<&Path>,
+) -> String {
+    let label = match kind {
+        EffectiveActionKind::CreateDir => "create_dir",
+        EffectiveActionKind::CreateFile => "create_file",
+        EffectiveActionKind::MoveFile => "move_file",
+        EffectiveActionKind::RenamePath => "rename_path",
+        EffectiveActionKind::ZipPath => "zip_path",
+        EffectiveActionKind::UnzipArchive => "unzip_archive",
+        EffectiveActionKind::DeleteToTrash => "delete_to_trash",
+        EffectiveActionKind::DeletePermanent => "delete_permanent",
+    };
+
+    match (source, destination) {
+        (Some(src), Some(dst)) => format!("{label}: {} -> {}", src.display(), dst.display()),
+        (Some(src), None) => format!("{label}: {}", src.display()),
+        (None, Some(dst)) => format!("{label}: {}", dst.display()),
+        (None, None) => label.to_string(),
     }
 }

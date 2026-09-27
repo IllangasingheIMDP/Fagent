@@ -2,9 +2,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use tracing::{info, info_span};
+use tracing::{info, info_span, warn};
 
-use crate::plan::{EffectiveActionKind, ValidatedPlan};
+use crate::plan::{EffectiveActionKind, ValidatedAction, ValidatedPlan};
 use crate::security::WorkspacePolicy;
 use crate::{FagentError, Result};
 
@@ -37,16 +37,105 @@ pub struct ExecutionFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackStatus {
+    Success(String),
+    Skipped(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RollbackActionReport {
+    pub action_id: String,
+    pub effective_kind: EffectiveActionKind,
+    pub status: RollbackStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RollbackReport {
+    pub rolled_back: Vec<RollbackActionReport>,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryDecision {
+    Retry,
+    Rollback,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackFailureDecision {
+    Retry,
+    Skip,
+    Abort,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionFailureContext {
+    pub action_id: String,
+    pub effective_kind: EffectiveActionKind,
+    pub source: Option<PathBuf>,
+    pub destination: Option<PathBuf>,
+    pub rationale: Option<String>,
+    pub error: String,
+    pub completed_actions_count: usize,
+    pub attempt: usize,
+}
+
+pub trait ExecutionRecoveryHandler: Send + Sync {
+    fn on_action_failure(&self, context: &ExecutionFailureContext) -> Result<RecoveryDecision>;
+    fn on_rollback_step(&self, report: &RollbackActionReport);
+    fn on_rollback_failure(&self, action_id: &str, error: &str) -> Result<RollbackFailureDecision> {
+        let _ = (action_id, error);
+        Ok(RollbackFailureDecision::Skip)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NonInteractiveRecoveryHandler;
+
+impl ExecutionRecoveryHandler for NonInteractiveRecoveryHandler {
+    fn on_action_failure(&self, _context: &ExecutionFailureContext) -> Result<RecoveryDecision> {
+        Ok(RecoveryDecision::Abort)
+    }
+
+    fn on_rollback_step(&self, _report: &RollbackActionReport) {}
+
+    fn on_rollback_failure(&self, _action_id: &str, _error: &str) -> Result<RollbackFailureDecision> {
+        Ok(RollbackFailureDecision::Skip)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UnzipArtifacts {
+    pub extracted_files: Vec<PathBuf>,
+    pub extracted_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutedActionRecord {
+    pub action_id: String,
+    pub effective_kind: EffectiveActionKind,
+    pub source: Option<PathBuf>,
+    pub destination: Option<PathBuf>,
+    pub created_dirs: Vec<PathBuf>,
+    pub extracted_artifacts: Option<UnzipArtifacts>,
+    pub trash_time: Option<std::time::SystemTime>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionReport {
     pub completed: Vec<String>,
     pub failed: Option<ExecutionFailure>,
     pub pending: Vec<String>,
+    pub rollback: Option<RollbackReport>,
+    pub retries: usize,
 }
 
 impl ExecutionReport {
     pub fn succeeded(&self) -> bool {
-        self.failed.is_none()
+        self.failed.is_none() && self.rollback.is_none()
     }
 }
 
@@ -61,146 +150,689 @@ impl Executor {
     }
 
     pub async fn run(&self, plan: &ValidatedPlan) -> ExecutionReport {
-        let mut completed = Vec::new();
+        self.run_with_recovery(plan, &NonInteractiveRecoveryHandler).await
+    }
 
-        for (index, action) in plan.actions.iter().enumerate() {
+    pub async fn run_with_recovery<H>(
+        &self,
+        plan: &ValidatedPlan,
+        handler: &H,
+    ) -> ExecutionReport
+    where
+        H: ExecutionRecoveryHandler,
+    {
+        let mut completed_records = Vec::new();
+        let mut completed_ids = Vec::new();
+        let mut current_index = 0;
+        let mut retries = 0;
+        let mut attempt = 1;
+
+        while current_index < plan.actions.len() {
+            let action = &plan.actions[current_index];
             let _span = info_span!("action", id = %action.id).entered();
-            info!("starting action");
-            let result = match action.effective_kind {
-                EffectiveActionKind::CreateDir => {
-                    self.create_dir(action.destination.as_ref().expect("validated"))
-                        .await
-                }
-                EffectiveActionKind::CreateFile => {
-                    self.create_file(
-                        action.destination.as_ref().expect("validated"),
-                        action.content.as_deref().expect("validated"),
-                    )
-                    .await
-                }
-                EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => {
-                    self.move_path(
-                        action.source.as_ref().expect("validated"),
-                        action.destination.as_ref().expect("validated"),
-                    )
-                    .await
-                }
-                EffectiveActionKind::ZipPath => {
-                    self.zip_path(
-                        action.source.as_ref().expect("validated"),
-                        action.destination.as_ref().expect("validated"),
-                    )
-                    .await
-                }
-                EffectiveActionKind::UnzipArchive => {
-                    self.unzip_archive(
-                        action.source.as_ref().expect("validated"),
-                        action.destination.as_ref().expect("validated"),
-                    )
-                    .await
-                }
-                EffectiveActionKind::DeleteToTrash => {
-                    self.delete_to_trash(action.source.as_ref().expect("validated"))
-                        .await
-                }
-                EffectiveActionKind::DeletePermanent => {
-                    self.delete_permanent(action.source.as_ref().expect("validated"))
-                        .await
-                }
-            };
+            info!("starting action (attempt {attempt})");
 
-            match result {
-                Ok(()) => completed.push(action.id.clone()),
+            match self.execute_action(action).await {
+                Ok(mut record) => {
+                    record.action_id = action.id.clone();
+                    completed_records.push(record);
+                    completed_ids.push(action.id.clone());
+                    current_index += 1;
+                    attempt = 1;
+                }
                 Err(error) => {
-                    return ExecutionReport {
-                        completed,
-                        failed: Some(ExecutionFailure {
-                            action_id: action.id.clone(),
-                            message: error.to_string(),
-                        }),
-                        pending: plan.actions[index + 1..]
-                            .iter()
-                            .map(|pending| pending.id.clone())
-                            .collect(),
+                    let error_message = error.to_string();
+                    warn!(
+                        action_id = %action.id,
+                        error = %error_message,
+                        "action failed during execution"
+                    );
+
+                    let context = ExecutionFailureContext {
+                        action_id: action.id.clone(),
+                        effective_kind: action.effective_kind.clone(),
+                        source: action.source.clone(),
+                        destination: action.destination.clone(),
+                        rationale: action.rationale.clone(),
+                        error: error_message.clone(),
+                        completed_actions_count: completed_records.len(),
+                        attempt,
                     };
+
+                    let decision = match handler.on_action_failure(&context) {
+                        Ok(d) => d,
+                        Err(_) => RecoveryDecision::Abort,
+                    };
+
+                    match decision {
+                        RecoveryDecision::Retry => {
+                            retries += 1;
+                            attempt += 1;
+                        }
+                        RecoveryDecision::Rollback => {
+                            let rollback_report =
+                                self.rollback_records(&completed_records, handler).await;
+                            return ExecutionReport {
+                                completed: completed_ids,
+                                failed: Some(ExecutionFailure {
+                                    action_id: action.id.clone(),
+                                    message: error_message,
+                                }),
+                                pending: plan.actions[current_index + 1..]
+                                    .iter()
+                                    .map(|p| p.id.clone())
+                                    .collect(),
+                                rollback: Some(rollback_report),
+                                retries,
+                            };
+                        }
+                        RecoveryDecision::Abort => {
+                            return ExecutionReport {
+                                completed: completed_ids,
+                                failed: Some(ExecutionFailure {
+                                    action_id: action.id.clone(),
+                                    message: error_message,
+                                }),
+                                pending: plan.actions[current_index + 1..]
+                                    .iter()
+                                    .map(|p| p.id.clone())
+                                    .collect(),
+                                rollback: None,
+                                retries,
+                            };
+                        }
+                    }
                 }
             }
         }
 
         ExecutionReport {
-            completed,
+            completed: completed_ids,
             failed: None,
             pending: Vec::new(),
+            rollback: None,
+            retries,
         }
     }
 
-    async fn create_dir(&self, destination: &Path) -> Result<()> {
-        fs::create_dir_all(destination).await?;
-        Ok(())
+    pub async fn rollback(
+        &self,
+        completed_records: &[ExecutedActionRecord],
+    ) -> RollbackReport {
+        self.rollback_records(completed_records, &NonInteractiveRecoveryHandler)
+            .await
     }
 
-    async fn create_file(&self, destination: &Path, content: &str) -> Result<()> {
-        if let Some(parent) = destination.parent() {
+    pub async fn rollback_records<H>(
+        &self,
+        completed_records: &[ExecutedActionRecord],
+        handler: &H,
+    ) -> RollbackReport
+    where
+        H: ExecutionRecoveryHandler,
+    {
+        let mut reports = Vec::new();
+        let mut all_success = true;
+
+        for record in completed_records.iter().rev() {
+            let action_id = record.action_id.clone();
+            let effective_kind = record.effective_kind.clone();
+
+            loop {
+                let status = self.rollback_record(record).await;
+                match &status {
+                    RollbackStatus::Success(_) | RollbackStatus::Skipped(_) => {
+                        let item = RollbackActionReport {
+                            action_id,
+                            effective_kind,
+                            status,
+                        };
+                        handler.on_rollback_step(&item);
+                        reports.push(item);
+                        break;
+                    }
+                    RollbackStatus::Failed(err) => {
+                        all_success = false;
+                        let decision = match handler.on_rollback_failure(&action_id, err) {
+                            Ok(d) => d,
+                            Err(_) => RollbackFailureDecision::Skip,
+                        };
+
+                        match decision {
+                            RollbackFailureDecision::Retry => {
+                                continue;
+                            }
+                            RollbackFailureDecision::Skip => {
+                                let item = RollbackActionReport {
+                                    action_id,
+                                    effective_kind,
+                                    status,
+                                };
+                                handler.on_rollback_step(&item);
+                                reports.push(item);
+                                break;
+                            }
+                            RollbackFailureDecision::Abort => {
+                                let item = RollbackActionReport {
+                                    action_id,
+                                    effective_kind,
+                                    status,
+                                };
+                                handler.on_rollback_step(&item);
+                                reports.push(item);
+                                return RollbackReport {
+                                    rolled_back: reports,
+                                    success: false,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        RollbackReport {
+            rolled_back: reports,
+            success: all_success,
+        }
+    }
+
+    pub async fn execute_action(
+        &self,
+        action: &ValidatedAction,
+    ) -> Result<ExecutedActionRecord> {
+        let mut record = match action.effective_kind {
+            EffectiveActionKind::CreateDir => {
+                self.create_dir(action.destination.as_ref().expect("validated"))
+                    .await?
+            }
+            EffectiveActionKind::CreateFile => {
+                self.create_file(
+                    action.destination.as_ref().expect("validated"),
+                    action.content.as_deref().expect("validated"),
+                )
+                .await?
+            }
+            EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => {
+                self.move_path(
+                    action.source.as_ref().expect("validated"),
+                    action.destination.as_ref().expect("validated"),
+                    action.effective_kind.clone(),
+                )
+                .await?
+            }
+            EffectiveActionKind::ZipPath => {
+                self.zip_path(
+                    action.source.as_ref().expect("validated"),
+                    action.destination.as_ref().expect("validated"),
+                )
+                .await?
+            }
+            EffectiveActionKind::UnzipArchive => {
+                self.unzip_archive(
+                    action.source.as_ref().expect("validated"),
+                    action.destination.as_ref().expect("validated"),
+                )
+                .await?
+            }
+            EffectiveActionKind::DeleteToTrash => {
+                self.delete_to_trash(action.source.as_ref().expect("validated"))
+                    .await?
+            }
+            EffectiveActionKind::DeletePermanent => {
+                self.delete_permanent(action.source.as_ref().expect("validated"))
+                    .await?
+            }
+        };
+
+        record.action_id = action.id.clone();
+        Ok(record)
+    }
+
+    pub async fn rollback_record(&self, record: &ExecutedActionRecord) -> RollbackStatus {
+        match record.effective_kind {
+            EffectiveActionKind::DeletePermanent => {
+                let path_display = record
+                    .source
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                RollbackStatus::Skipped(format!(
+                    "cannot roll back permanent deletion of `{path_display}`: permanently deleted files cannot be restored"
+                ))
+            }
+            EffectiveActionKind::DeleteToTrash => {
+                let source = match &record.source {
+                    Some(s) => s.clone(),
+                    None => {
+                        return RollbackStatus::Failed(
+                            "missing source path for trash rollback".into(),
+                        );
+                    }
+                };
+
+                let res = tokio::task::spawn_blocking(move || -> Result<RollbackStatus> {
+                    match trash::os_limited::list() {
+                        Ok(items) => {
+                            let candidate = items
+                                .into_iter()
+                                .filter(|item| paths_match(&item.original_path(), &source))
+                                .max_by_key(|item| item.time_deleted);
+
+                            if let Some(item) = candidate {
+                                match trash::os_limited::restore_all([item]) {
+                                    Ok(()) => Ok(RollbackStatus::Success(format!(
+                                        "restored `{}` from OS trash",
+                                        source.display()
+                                    ))),
+                                    Err(err) => Ok(RollbackStatus::Failed(format!(
+                                        "failed to restore `{}` from OS trash: {err}",
+                                        source.display()
+                                    ))),
+                                }
+                            } else {
+                                Ok(RollbackStatus::Skipped(format!(
+                                    "could not locate `{}` in OS trash (file may still be in Recycle Bin)",
+                                    source.display()
+                                )))
+                            }
+                        }
+                        Err(err) => Ok(RollbackStatus::Skipped(format!(
+                            "OS trash listing unavailable on this platform ({err}); file remains in Recycle Bin"
+                        ))),
+                    }
+                })
+                .await;
+
+                match res {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(err)) => RollbackStatus::Failed(err.to_string()),
+                    Err(err) => RollbackStatus::Failed(err.to_string()),
+                }
+            }
+            EffectiveActionKind::CreateFile => {
+                let destination = match &record.destination {
+                    Some(d) => d,
+                    None => {
+                        return RollbackStatus::Failed(
+                            "missing destination for CreateFile rollback".into(),
+                        );
+                    }
+                };
+
+                if destination.exists() {
+                    if let Err(err) = fs::remove_file(destination).await {
+                        return RollbackStatus::Failed(format!(
+                            "failed to delete created file `{}`: {err}",
+                            destination.display()
+                        ));
+                    }
+                }
+
+                for dir in &record.created_dirs {
+                    if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                        let _ = fs::remove_dir(dir).await;
+                    }
+                }
+
+                RollbackStatus::Success(format!(
+                    "deleted created file `{}`",
+                    destination.display()
+                ))
+            }
+            EffectiveActionKind::CreateDir => {
+                for dir in &record.created_dirs {
+                    if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                        let _ = fs::remove_dir(dir).await;
+                    }
+                }
+                let dest_display = record
+                    .destination
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                RollbackStatus::Success(format!(
+                    "removed created directory `{dest_display}`"
+                ))
+            }
+            EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => {
+                let source = match &record.source {
+                    Some(s) => s,
+                    None => {
+                        return RollbackStatus::Failed(
+                            "missing source path for Move rollback".into(),
+                        );
+                    }
+                };
+                let destination = match &record.destination {
+                    Some(d) => d,
+                    None => {
+                        return RollbackStatus::Failed(
+                            "missing destination path for Move rollback".into(),
+                        );
+                    }
+                };
+
+                if !destination.exists() {
+                    return RollbackStatus::Failed(format!(
+                        "cannot restore `{}` to `{}` because moved path no longer exists",
+                        destination.display(),
+                        source.display()
+                    ));
+                }
+
+                if let Some(parent) = source.parent() {
+                    if let Err(err) = fs::create_dir_all(parent).await {
+                        return RollbackStatus::Failed(format!(
+                            "failed to recreate parent directory for `{}`: {err}",
+                            source.display()
+                        ));
+                    }
+                }
+
+                match fs::rename(destination, source).await {
+                    Ok(()) => {}
+                    Err(err) if is_cross_device_error(&err) => {
+                        if let Err(e) =
+                            self.copy_then_remove(destination.clone(), source.clone()).await
+                        {
+                            return RollbackStatus::Failed(format!(
+                                "failed to move `{}` back to `{}` across devices: {e}",
+                                destination.display(),
+                                source.display()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        return RollbackStatus::Failed(format!(
+                            "failed to move `{}` back to `{}`: {err}",
+                            destination.display(),
+                            source.display()
+                        ));
+                    }
+                }
+
+                for dir in &record.created_dirs {
+                    if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                        let _ = fs::remove_dir(dir).await;
+                    }
+                }
+
+                RollbackStatus::Success(format!(
+                    "moved `{}` back to `{}`",
+                    destination.display(),
+                    source.display()
+                ))
+            }
+            EffectiveActionKind::ZipPath => {
+                let destination = match &record.destination {
+                    Some(d) => d,
+                    None => {
+                        return RollbackStatus::Failed(
+                            "missing destination for Zip rollback".into(),
+                        );
+                    }
+                };
+
+                if destination.exists() {
+                    if let Err(err) = fs::remove_file(destination).await {
+                        return RollbackStatus::Failed(format!(
+                            "failed to delete zip archive `{}`: {err}",
+                            destination.display()
+                        ));
+                    }
+                }
+
+                for dir in &record.created_dirs {
+                    if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                        let _ = fs::remove_dir(dir).await;
+                    }
+                }
+
+                RollbackStatus::Success(format!(
+                    "deleted zip archive `{}`",
+                    destination.display()
+                ))
+            }
+            EffectiveActionKind::UnzipArchive => {
+                if let Some(artifacts) = &record.extracted_artifacts {
+                    for file in &artifacts.extracted_files {
+                        if file.exists() {
+                            let _ = fs::remove_file(file).await;
+                        }
+                    }
+                    for dir in artifacts.extracted_dirs.iter().rev() {
+                        if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                            let _ = fs::remove_dir(dir).await;
+                        }
+                    }
+                }
+
+                for dir in &record.created_dirs {
+                    if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                        let _ = fs::remove_dir(dir).await;
+                    }
+                }
+
+                let dest_display = record
+                    .destination
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                RollbackStatus::Success(format!(
+                    "removed extracted files from `{dest_display}`"
+                ))
+            }
+        }
+    }
+
+    async fn create_dir(&self, destination: &Path) -> Result<ExecutedActionRecord> {
+        let created_dirs = find_missing_ancestors(destination);
+        if let Err(err) = fs::create_dir_all(destination).await {
+            for dir in &created_dirs {
+                if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                    let _ = fs::remove_dir(dir).await;
+                }
+            }
+            return Err(err.into());
+        }
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::CreateDir,
+            source: None,
+            destination: Some(destination.to_path_buf()),
+            created_dirs,
+            extracted_artifacts: None,
+            trash_time: None,
+        })
+    }
+
+    async fn create_file(&self, destination: &Path, content: &str) -> Result<ExecutedActionRecord> {
+        let created_dirs = if let Some(parent) = destination.parent() {
+            let missing = find_missing_ancestors(parent);
             fs::create_dir_all(parent).await?;
+            missing
+        } else {
+            Vec::new()
+        };
+
+        if let Err(err) = fs::write(destination, content).await {
+            if destination.exists() {
+                let _ = fs::remove_file(destination).await;
+            }
+            for dir in &created_dirs {
+                if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                    let _ = fs::remove_dir(dir).await;
+                }
+            }
+            return Err(err.into());
         }
-        fs::write(destination, content).await?;
-        Ok(())
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::CreateFile,
+            source: None,
+            destination: Some(destination.to_path_buf()),
+            created_dirs,
+            extracted_artifacts: None,
+            trash_time: None,
+        })
     }
 
-    async fn move_path(&self, source: &Path, destination: &Path) -> Result<()> {
-        if let Some(parent) = destination.parent() {
+    async fn move_path(
+        &self,
+        source: &Path,
+        destination: &Path,
+        effective_kind: EffectiveActionKind,
+    ) -> Result<ExecutedActionRecord> {
+        let created_dirs = if let Some(parent) = destination.parent() {
+            let missing = find_missing_ancestors(parent);
             fs::create_dir_all(parent).await?;
-        }
+            missing
+        } else {
+            Vec::new()
+        };
 
-        match fs::rename(source, destination).await {
+        let move_res = match fs::rename(source, destination).await {
             Ok(()) => Ok(()),
             Err(error) if is_cross_device_error(&error) => {
                 self.copy_then_remove(source.to_path_buf(), destination.to_path_buf())
                     .await
             }
             Err(error) => Err(error.into()),
+        };
+
+        if let Err(err) = move_res {
+            for dir in &created_dirs {
+                if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                    let _ = fs::remove_dir(dir).await;
+                }
+            }
+            return Err(err);
         }
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind,
+            source: Some(source.to_path_buf()),
+            destination: Some(destination.to_path_buf()),
+            created_dirs,
+            extracted_artifacts: None,
+            trash_time: None,
+        })
     }
 
-    async fn zip_path(&self, source: &Path, destination: &Path) -> Result<()> {
-        if let Some(parent) = destination.parent() {
+    async fn zip_path(&self, source: &Path, destination: &Path) -> Result<ExecutedActionRecord> {
+        let created_dirs = if let Some(parent) = destination.parent() {
+            let missing = find_missing_ancestors(parent);
             fs::create_dir_all(parent).await?;
+            missing
+        } else {
+            Vec::new()
+        };
+
+        let source_for_zip = source.to_path_buf();
+        let destination_buf = destination.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            zip_path_sync(&source_for_zip, &destination_buf)
+        })
+        .await?;
+
+        if let Err(err) = result {
+            if destination.exists() {
+                let _ = fs::remove_file(destination).await;
+            }
+            for dir in &created_dirs {
+                if dir.exists() && dir.is_dir() && is_dir_empty(dir).await {
+                    let _ = fs::remove_dir(dir).await;
+                }
+            }
+            return Err(err);
         }
 
-        let source = source.to_path_buf();
-        let destination = destination.to_path_buf();
-        tokio::task::spawn_blocking(move || zip_path_sync(&source, &destination)).await??;
-        Ok(())
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::ZipPath,
+            source: Some(source.to_path_buf()),
+            destination: Some(destination.to_path_buf()),
+            created_dirs,
+            extracted_artifacts: None,
+            trash_time: None,
+        })
     }
 
-    async fn unzip_archive(&self, source: &Path, destination: &Path) -> Result<()> {
-        if let Some(parent) = destination.parent() {
+    async fn unzip_archive(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<ExecutedActionRecord> {
+        let created_dirs = if let Some(parent) = destination.parent() {
+            let missing = find_missing_ancestors(parent);
             fs::create_dir_all(parent).await?;
-        }
+            missing
+        } else {
+            Vec::new()
+        };
 
-        let source = source.to_path_buf();
-        let destination = destination.to_path_buf();
-        tokio::task::spawn_blocking(move || unzip_archive_sync(&source, &destination)).await??;
-        Ok(())
+        let dest_missing = find_missing_ancestors(destination);
+        let mut all_created_dirs = dest_missing;
+        all_created_dirs.extend(created_dirs);
+
+        let source_for_unzip = source.to_path_buf();
+        let destination_buf = destination.to_path_buf();
+        let artifacts = tokio::task::spawn_blocking(move || {
+            unzip_archive_sync(&source_for_unzip, &destination_buf)
+        })
+        .await??;
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::UnzipArchive,
+            source: Some(source.to_path_buf()),
+            destination: Some(destination.to_path_buf()),
+            created_dirs: all_created_dirs,
+            extracted_artifacts: Some(artifacts),
+            trash_time: None,
+        })
     }
 
-    async fn delete_to_trash(&self, source: &Path) -> Result<()> {
-        let source = source.to_path_buf();
+    async fn delete_to_trash(&self, source: &Path) -> Result<ExecutedActionRecord> {
+        let source_buf = source.to_path_buf();
+        let time_before = std::time::SystemTime::now();
         tokio::task::spawn_blocking(move || {
-            trash::delete(&source)
+            trash::delete(&source_buf)
                 .map_err(|error| FagentError::Execution(format!("trash failed: {error}")))
         })
         .await??;
-        Ok(())
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::DeleteToTrash,
+            source: Some(source.to_path_buf()),
+            destination: None,
+            created_dirs: Vec::new(),
+            extracted_artifacts: None,
+            trash_time: Some(time_before),
+        })
     }
 
-    async fn delete_permanent(&self, source: &Path) -> Result<()> {
+    async fn delete_permanent(&self, source: &Path) -> Result<ExecutedActionRecord> {
         if source.is_dir() {
             fs::remove_dir_all(source).await?;
         } else {
             fs::remove_file(source).await?;
         }
-        Ok(())
+
+        Ok(ExecutedActionRecord {
+            action_id: String::new(),
+            effective_kind: EffectiveActionKind::DeletePermanent,
+            source: Some(source.to_path_buf()),
+            destination: None,
+            created_dirs: Vec::new(),
+            extracted_artifacts: None,
+            trash_time: None,
+        })
     }
 
     async fn copy_then_remove(&self, source: PathBuf, destination: PathBuf) -> Result<()> {
@@ -210,17 +842,85 @@ impl Executor {
             copy_path_sync(&source_for_copy, &destination_for_copy)
         })
         .await??;
-        if source.is_dir() {
-            fs::remove_dir_all(&source).await?;
+
+        let remove_res = if source.is_dir() {
+            fs::remove_dir_all(&source).await
         } else {
-            fs::remove_file(&source).await?;
+            fs::remove_file(&source).await
+        };
+
+        if let Err(err) = remove_res {
+            if destination.is_dir() {
+                let _ = fs::remove_dir_all(&destination).await;
+            } else {
+                let _ = fs::remove_file(&destination).await;
+            }
+            return Err(err.into());
         }
+
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn policy(&self) -> &WorkspacePolicy {
         &self.policy
+    }
+}
+
+pub fn find_missing_ancestors(path: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        if let Some(parent) = cursor.parent() {
+            cursor = parent;
+        } else {
+            break;
+        }
+    }
+    missing
+}
+
+async fn is_dir_empty(path: &Path) -> bool {
+    if let Ok(mut entries) = fs::read_dir(path).await {
+        match entries.next_entry().await {
+            Ok(None) => true,
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+pub fn is_file_locked_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("used by another process")
+        || lower.contains("sharing violation")
+        || lower.contains("os error 32")
+        || lower.contains("os error 33")
+        || lower.contains("os error 5")
+        || lower.contains("access is denied")
+        || lower.contains("lock violation")
+        || lower.contains("resource busy")
+        || lower.contains("text file busy")
+}
+
+fn paths_match(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        if ca == cb {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -319,7 +1019,7 @@ fn normalize_zip_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn unzip_archive_sync(source: &Path, destination: &Path) -> Result<()> {
+fn unzip_archive_sync(source: &Path, destination: &Path) -> Result<UnzipArtifacts> {
     unzip_archive_sync_with_limits(source, destination, DEFAULT_UNZIP_LIMITS)
 }
 
@@ -327,133 +1027,155 @@ fn unzip_archive_sync_with_limits(
     source: &Path,
     destination: &Path,
     limits: UnzipLimits,
-) -> Result<()> {
-    let input = std::fs::File::open(source)?;
-    let mut archive = zip::ZipArchive::new(input)
-        .map_err(|error| FagentError::Execution(format!("unzip failed to open archive: {error}")))?;
+) -> Result<UnzipArtifacts> {
+    let mut artifacts = UnzipArtifacts::default();
 
-    if archive.len() > limits.max_entries {
-        return Err(FagentError::Execution(format!(
-            "unzip rejected archive with too many entries: {} (limit={})",
-            archive.len(),
-            limits.max_entries
-        )));
+    let res = (|| -> Result<()> {
+        let input = std::fs::File::open(source)?;
+        let mut archive = zip::ZipArchive::new(input)
+            .map_err(|error| FagentError::Execution(format!("unzip failed to open archive: {error}")))?;
+
+        if archive.len() > limits.max_entries {
+            return Err(FagentError::Execution(format!(
+                "unzip rejected archive with too many entries: {} (limit={})",
+                archive.len(),
+                limits.max_entries
+            )));
+        }
+
+        std::fs::create_dir_all(destination)?;
+        let mut total_uncompressed = 0_u64;
+
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|error| {
+                FagentError::Execution(format!("unzip failed to read archive entry: {error}"))
+            })?;
+
+            if let Some(mode) = entry.unix_mode() {
+                let file_type = mode & 0o170000;
+                if file_type == 0o120000 {
+                    return Err(FagentError::Execution(format!(
+                        "unzip rejected symlink entry: {}",
+                        entry.name()
+                    )));
+                }
+
+                if file_type != 0 && file_type != 0o040000 && file_type != 0o100000 {
+                    return Err(FagentError::Execution(format!(
+                        "unzip rejected special file entry: {}",
+                        entry.name()
+                    )));
+                }
+            }
+
+            let declared_size = entry.size();
+            if declared_size > limits.max_entry_uncompressed_bytes {
+                return Err(FagentError::Execution(format!(
+                    "unzip rejected oversized entry {} bytes for {} (limit={})",
+                    declared_size,
+                    entry.name(),
+                    limits.max_entry_uncompressed_bytes
+                )));
+            }
+
+            let compressed_size = entry.compressed_size();
+            if compressed_size == 0 {
+                if declared_size > 0 {
+                    return Err(FagentError::Execution(format!(
+                        "unzip rejected suspicious compressed size for {}",
+                        entry.name()
+                    )));
+                }
+            } else if (declared_size as u128)
+                > (compressed_size as u128) * (limits.max_compression_ratio as u128)
+            {
+                return Err(FagentError::Execution(format!(
+                    "unzip rejected high compression ratio for {} ({} / {} > {})",
+                    entry.name(),
+                    declared_size,
+                    compressed_size,
+                    limits.max_compression_ratio
+                )));
+            }
+
+            let enclosed = entry.enclosed_name().map(|path| path.to_path_buf()).ok_or_else(|| {
+                FagentError::Execution(format!(
+                    "unzip rejected unsafe archive entry path: {}",
+                    entry.name()
+                ))
+            })?;
+            if enclosed.components().count() > limits.max_path_depth {
+                return Err(FagentError::Execution(format!(
+                    "unzip rejected deep archive path for {} (depth limit={})",
+                    entry.name(),
+                    limits.max_path_depth
+                )));
+            }
+            let output = destination.join(enclosed);
+
+            if entry.name().ends_with('/') {
+                std::fs::create_dir_all(&output)?;
+                artifacts.extracted_dirs.push(output);
+                continue;
+            }
+
+            if output.exists() {
+                return Err(FagentError::Execution(format!(
+                    "unzip would overwrite existing path: {}",
+                    output.display()
+                )));
+            }
+
+            if let Some(parent) = output.parent() {
+                let missing_ancestors = find_missing_ancestors(parent);
+                std::fs::create_dir_all(parent)?;
+                artifacts.extracted_dirs.extend(missing_ancestors);
+            }
+
+            let mut file = std::fs::File::create(&output)?;
+            let entry_name = entry.name().to_string();
+            let written = copy_with_limit(
+                &mut entry,
+                &mut file,
+                limits.max_entry_uncompressed_bytes,
+                &format!("entry {entry_name}"),
+            )?;
+            artifacts.extracted_files.push(output.clone());
+
+            total_uncompressed = total_uncompressed.checked_add(written).ok_or_else(|| {
+                FagentError::Execution("unzip rejected archive because extracted size overflowed".into())
+            })?;
+            if total_uncompressed > limits.max_total_uncompressed_bytes {
+                return Err(FagentError::Execution(format!(
+                    "unzip rejected archive because total extracted size exceeds limit: {} > {}",
+                    total_uncompressed,
+                    limits.max_total_uncompressed_bytes
+                )));
+            }
+
+            #[cfg(unix)]
+            if let Some(mode) = entry.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                let safe_mode = mode & 0o777;
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(safe_mode))?;
+            }
+        }
+
+        Ok(())
+    })();
+
+    match res {
+        Ok(()) => Ok(artifacts),
+        Err(err) => {
+            for file in &artifacts.extracted_files {
+                let _ = std::fs::remove_file(file);
+            }
+            for dir in artifacts.extracted_dirs.iter().rev() {
+                let _ = std::fs::remove_dir(dir);
+            }
+            Err(err)
+        }
     }
-
-    std::fs::create_dir_all(destination)?;
-    let mut total_uncompressed = 0_u64;
-
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|error| {
-            FagentError::Execution(format!("unzip failed to read archive entry: {error}"))
-        })?;
-
-        if let Some(mode) = entry.unix_mode() {
-            let file_type = mode & 0o170000;
-            if file_type == 0o120000 {
-                return Err(FagentError::Execution(format!(
-                    "unzip rejected symlink entry: {}",
-                    entry.name()
-                )));
-            }
-
-            if file_type != 0 && file_type != 0o040000 && file_type != 0o100000 {
-                return Err(FagentError::Execution(format!(
-                    "unzip rejected special file entry: {}",
-                    entry.name()
-                )));
-            }
-        }
-
-        let declared_size = entry.size();
-        if declared_size > limits.max_entry_uncompressed_bytes {
-            return Err(FagentError::Execution(format!(
-                "unzip rejected oversized entry {} bytes for {} (limit={})",
-                declared_size,
-                entry.name(),
-                limits.max_entry_uncompressed_bytes
-            )));
-        }
-
-        let compressed_size = entry.compressed_size();
-        if compressed_size == 0 {
-            if declared_size > 0 {
-                return Err(FagentError::Execution(format!(
-                    "unzip rejected suspicious compressed size for {}",
-                    entry.name()
-                )));
-            }
-        } else if (declared_size as u128)
-            > (compressed_size as u128) * (limits.max_compression_ratio as u128)
-        {
-            return Err(FagentError::Execution(format!(
-                "unzip rejected high compression ratio for {} ({} / {} > {})",
-                entry.name(),
-                declared_size,
-                compressed_size,
-                limits.max_compression_ratio
-            )));
-        }
-
-        let enclosed = entry.enclosed_name().map(|path| path.to_path_buf()).ok_or_else(|| {
-            FagentError::Execution(format!(
-                "unzip rejected unsafe archive entry path: {}",
-                entry.name()
-            ))
-        })?;
-        if enclosed.components().count() > limits.max_path_depth {
-            return Err(FagentError::Execution(format!(
-                "unzip rejected deep archive path for {} (depth limit={})",
-                entry.name(),
-                limits.max_path_depth
-            )));
-        }
-        let output = destination.join(enclosed);
-
-        if entry.name().ends_with('/') {
-            std::fs::create_dir_all(&output)?;
-            continue;
-        }
-
-        if output.exists() {
-            return Err(FagentError::Execution(format!(
-                "unzip would overwrite existing path: {}",
-                output.display()
-            )));
-        }
-
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut file = std::fs::File::create(&output)?;
-        let entry_name = entry.name().to_string();
-        let written = copy_with_limit(
-            &mut entry,
-            &mut file,
-            limits.max_entry_uncompressed_bytes,
-            &format!("entry {entry_name}"),
-        )?;
-        total_uncompressed = total_uncompressed.checked_add(written).ok_or_else(|| {
-            FagentError::Execution("unzip rejected archive because extracted size overflowed".into())
-        })?;
-        if total_uncompressed > limits.max_total_uncompressed_bytes {
-            return Err(FagentError::Execution(format!(
-                "unzip rejected archive because total extracted size exceeds limit: {} > {}",
-                total_uncompressed,
-                limits.max_total_uncompressed_bytes
-            )));
-        }
-
-        #[cfg(unix)]
-        if let Some(mode) = entry.unix_mode() {
-            use std::os::unix::fs::PermissionsExt;
-            let safe_mode = mode & 0o777;
-            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(safe_mode))?;
-        }
-    }
-
-    Ok(())
 }
 
 fn copy_with_limit<R: Read, W: Write>(
@@ -814,5 +1536,424 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("total extracted size exceeds limit"));
+    }
+
+    use super::{
+        ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision,
+        RollbackActionReport, RollbackStatus, is_file_locked_error,
+    };
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockRecoveryHandler {
+        decisions: Mutex<Vec<RecoveryDecision>>,
+        pub call_count: AtomicUsize,
+    }
+
+    impl MockRecoveryHandler {
+        fn new(decisions: Vec<RecoveryDecision>) -> Self {
+            Self {
+                decisions: Mutex::new(decisions),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ExecutionRecoveryHandler for MockRecoveryHandler {
+        fn on_action_failure(
+            &self,
+            _context: &ExecutionFailureContext,
+        ) -> crate::Result<RecoveryDecision> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.decisions.lock().unwrap();
+            if guard.is_empty() {
+                Ok(RecoveryDecision::Abort)
+            } else {
+                Ok(guard.remove(0))
+            }
+        }
+
+        fn on_rollback_step(&self, _report: &RollbackActionReport) {}
+    }
+
+    #[tokio::test]
+    async fn rollback_create_file_removes_file_and_empty_parent() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let target = workspace.join("sub").join("nested").join("test.txt");
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::CreateFile,
+            effective_kind: EffectiveActionKind::CreateFile,
+            source: None,
+            destination: Some(target.clone()),
+            content: Some("hello rollback".into()),
+            display_source: None,
+            display_destination: Some("sub/nested/test.txt".into()),
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(target.exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert!(!target.exists());
+        assert!(!workspace.join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_create_dir_preserves_existing_parent() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let existing = workspace.join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let new_folder = existing.join("level1").join("level2");
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::CreateDir,
+            effective_kind: EffectiveActionKind::CreateDir,
+            source: None,
+            destination: Some(new_folder.clone()),
+            content: None,
+            display_source: None,
+            display_destination: Some("existing/level1/level2".into()),
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(new_folder.exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert!(!new_folder.exists());
+        assert!(!existing.join("level1").exists());
+        assert!(existing.exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_move_file_restores_original_file() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("original.txt");
+        fs::write(&source, "move me back").unwrap();
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let destination = workspace.join("archive").join("original.txt");
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::MoveFile,
+            effective_kind: EffectiveActionKind::MoveFile,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            content: None,
+            display_source: Some("original.txt".into()),
+            display_destination: Some("archive/original.txt".into()),
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(destination.exists());
+        assert!(!source.exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert!(source.exists());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "move me back");
+        assert!(!destination.exists());
+        assert!(!workspace.join("archive").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_zip_path_removes_archive_and_keeps_source() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let docs = workspace.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("doc.txt"), "hello").unwrap();
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let zip_dest = workspace.join("backup.zip");
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::ZipPath,
+            effective_kind: EffectiveActionKind::ZipPath,
+            source: Some(docs.clone()),
+            destination: Some(zip_dest.clone()),
+            content: None,
+            display_source: Some("docs".into()),
+            display_destination: Some("backup.zip".into()),
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(zip_dest.exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert!(!zip_dest.exists());
+        assert!(docs.join("doc.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_unzip_archive_removes_extracted_files() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let archive_path = workspace.join("test.zip");
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "unpacked/inner.txt",
+                    zip::write::FileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(b"inner content").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let out_dir = workspace.join("extracted");
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::UnzipArchive,
+            effective_kind: EffectiveActionKind::UnzipArchive,
+            source: Some(archive_path.clone()),
+            destination: Some(out_dir.clone()),
+            content: None,
+            display_source: Some("test.zip".into()),
+            display_destination: Some("extracted".into()),
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(out_dir.join("unpacked").join("inner.txt").exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert!(!out_dir.exists());
+        assert!(archive_path.exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_delete_permanent_is_skipped_with_notice() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let victim = workspace.join("victim.txt");
+        fs::write(&victim, "will be permanently gone").unwrap();
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, true).unwrap();
+        let executor = Executor::new(policy);
+
+        let action = ValidatedAction {
+            id: "1".into(),
+            kind: ActionKind::DeletePath,
+            effective_kind: EffectiveActionKind::DeletePermanent,
+            source: Some(victim.clone()),
+            destination: None,
+            content: None,
+            display_source: Some("victim.txt".into()),
+            display_destination: None,
+            rationale: None,
+            warnings: vec![],
+        };
+
+        let record = executor.execute_action(&action).await.unwrap();
+        assert!(!victim.exists());
+
+        let report = executor.rollback(&[record]).await;
+        assert!(report.success);
+        assert_eq!(report.rolled_back.len(), 1);
+        match &report.rolled_back[0].status {
+            RollbackStatus::Skipped(msg) => {
+                assert!(msg.contains("permanently deleted files cannot be restored"));
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_multiple_actions_in_reverse_order() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let orig_file = workspace.join("orig.txt");
+        fs::write(&orig_file, "original content").unwrap();
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let dir_target = workspace.join("project");
+        let file_target = dir_target.join("readme.md");
+        let move_target = dir_target.join("renamed.txt");
+
+        let plan = ValidatedPlan {
+            workspace_root: workspace.clone(),
+            warnings: vec![],
+            actions: vec![
+                ValidatedAction {
+                    id: "1".into(),
+                    kind: ActionKind::CreateDir,
+                    effective_kind: EffectiveActionKind::CreateDir,
+                    source: None,
+                    destination: Some(dir_target.clone()),
+                    content: None,
+                    display_source: None,
+                    display_destination: Some("project".into()),
+                    rationale: None,
+                    warnings: vec![],
+                },
+                ValidatedAction {
+                    id: "2".into(),
+                    kind: ActionKind::CreateFile,
+                    effective_kind: EffectiveActionKind::CreateFile,
+                    source: None,
+                    destination: Some(file_target.clone()),
+                    content: Some("# Project".into()),
+                    display_source: None,
+                    display_destination: Some("project/readme.md".into()),
+                    rationale: None,
+                    warnings: vec![],
+                },
+                ValidatedAction {
+                    id: "3".into(),
+                    kind: ActionKind::MoveFile,
+                    effective_kind: EffectiveActionKind::MoveFile,
+                    source: Some(orig_file.clone()),
+                    destination: Some(move_target.clone()),
+                    content: None,
+                    display_source: Some("orig.txt".into()),
+                    display_destination: Some("project/renamed.txt".into()),
+                    rationale: None,
+                    warnings: vec![],
+                },
+                ValidatedAction {
+                    id: "4".into(),
+                    kind: ActionKind::MoveFile,
+                    effective_kind: EffectiveActionKind::MoveFile,
+                    source: Some(workspace.join("nonexistent.txt")),
+                    destination: Some(workspace.join("nowhere.txt")),
+                    content: None,
+                    display_source: Some("nonexistent.txt".into()),
+                    display_destination: Some("nowhere.txt".into()),
+                    rationale: None,
+                    warnings: vec![],
+                },
+            ],
+        };
+
+        let handler = MockRecoveryHandler::new(vec![RecoveryDecision::Rollback]);
+        let report = executor.run_with_recovery(&plan, &handler).await;
+
+        assert!(!report.succeeded());
+        assert_eq!(report.completed, vec!["1", "2", "3"]);
+        assert!(report.rollback.is_some());
+        let rollback = report.rollback.unwrap();
+        assert!(rollback.success);
+        assert_eq!(rollback.rolled_back.len(), 3);
+        assert_eq!(rollback.rolled_back[0].action_id, "3");
+        assert_eq!(rollback.rolled_back[1].action_id, "2");
+        assert_eq!(rollback.rolled_back[2].action_id, "1");
+
+        assert!(orig_file.exists());
+        assert_eq!(fs::read_to_string(&orig_file).unwrap(), "original content");
+        assert!(!file_target.exists());
+        assert!(!move_target.exists());
+        assert!(!dir_target.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_retry_succeeds_on_second_attempt() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let policy = WorkspacePolicy::new(workspace.clone(), false, false).unwrap();
+        let executor = Executor::new(policy);
+
+        let missing = workspace.join("to_be_created.txt");
+        let dest = workspace.join("dest.txt");
+
+        let plan = ValidatedPlan {
+            workspace_root: workspace.clone(),
+            warnings: vec![],
+            actions: vec![ValidatedAction {
+                id: "1".into(),
+                kind: ActionKind::MoveFile,
+                effective_kind: EffectiveActionKind::MoveFile,
+                source: Some(missing.clone()),
+                destination: Some(dest.clone()),
+                content: None,
+                display_source: Some("to_be_created.txt".into()),
+                display_destination: Some("dest.txt".into()),
+                rationale: None,
+                warnings: vec![],
+            }],
+        };
+
+        struct RetryOnceHandler {
+            created_flag: PathBuf,
+        }
+        impl ExecutionRecoveryHandler for RetryOnceHandler {
+            fn on_action_failure(
+                &self,
+                context: &ExecutionFailureContext,
+            ) -> crate::Result<RecoveryDecision> {
+                if context.attempt == 1 {
+                    fs::write(&self.created_flag, "now available").unwrap();
+                    Ok(RecoveryDecision::Retry)
+                } else {
+                    Ok(RecoveryDecision::Abort)
+                }
+            }
+
+            fn on_rollback_step(&self, _report: &RollbackActionReport) {}
+        }
+
+        let handler = RetryOnceHandler {
+            created_flag: missing.clone(),
+        };
+        let report = executor.run_with_recovery(&plan, &handler).await;
+
+        assert!(report.succeeded());
+        assert_eq!(report.retries, 1);
+        assert!(dest.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "now available");
+    }
+
+    #[test]
+    fn test_is_file_locked_error() {
+        assert!(is_file_locked_error("The process cannot access the file because it is being used by another process. (os error 32)"));
+        assert!(is_file_locked_error("Access is denied. (os error 5)"));
+        assert!(is_file_locked_error("sharing violation"));
+        assert!(is_file_locked_error("lock violation"));
+        assert!(is_file_locked_error("os error 33"));
+        assert!(!is_file_locked_error("No such file or directory (os error 2)"));
     }
 }

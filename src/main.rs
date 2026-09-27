@@ -96,14 +96,26 @@ async fn run_instruction_loop(
 
         match ui::review_plan(&validated_plan, &instruction)? {
             ReviewChoice::Approve => {
-                let report = executor.run(&validated_plan).await;
+                let handler = ui::InteractiveRecoveryHandler;
+                let report = executor.run_with_recovery(&validated_plan, &handler).await;
                 ui::print_execution_report(&report);
+                if let Some(rollback) = &report.rollback {
+                    ui::print_rollback_summary(rollback);
+                }
                 if report.succeeded() {
                     return Ok(());
                 }
-                return Err(FagentError::Execution(
-                    "execution stopped after the first failure".into(),
-                ));
+                match ui::prompt_post_failure_action(&instruction)? {
+                    ui::PostFailureChoice::Edit(new_instruction) => {
+                        instruction = new_instruction;
+                        continue;
+                    }
+                    ui::PostFailureChoice::Exit => {
+                        return Err(FagentError::Execution(
+                            "execution stopped after failure".into(),
+                        ));
+                    }
+                }
             }
             ReviewChoice::Cancel => return Ok(()),
             ReviewChoice::Edit(new_instruction) => instruction = new_instruction,
