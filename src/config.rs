@@ -7,7 +7,7 @@ use figment::{
     Figment,
     providers::{Format, Serialized, Toml},
 };
-use inquire::{Password, Select, Text};
+use inquire::{Password, PasswordDisplayMode, Select, Text};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +107,8 @@ pub fn run_setup() -> Result<()> {
         config.ollama_base_url = Some(ollama_base_url);
     } else {
         let api_key = Password::new("Provider API key (stored in the OS keychain):")
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .with_display_toggle_enabled()
             .without_confirmation()
             .prompt()?;
         store_api_key(&provider, &api_key)?;
