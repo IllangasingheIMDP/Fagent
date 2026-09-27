@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use tracing::info;
+use tracing::{info, info_span};
 
 use crate::plan::{EffectiveActionKind, ValidatedPlan};
 use crate::security::WorkspacePolicy;
@@ -64,7 +64,8 @@ impl Executor {
         let mut completed = Vec::new();
 
         for (index, action) in plan.actions.iter().enumerate() {
-            info!("executing action {}", action.id);
+            let _span = info_span!("action", id = %action.id).entered();
+            info!("starting action");
             let result = match action.effective_kind {
                 EffectiveActionKind::CreateDir => {
                     self.create_dir(action.destination.as_ref().expect("validated"))

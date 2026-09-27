@@ -56,7 +56,7 @@ impl ProviderKind {
         match self {
             Self::OpenAi => "gpt-4.1-mini",
             Self::Anthropic => "claude-3-7-sonnet-latest",
-            Self::Gemini => "gemini-2.5-flash",
+            Self::Gemini => "gemini-3.5-flash-lite",
             Self::Ollama => "llama3.1:8b",
         }
     }

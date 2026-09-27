@@ -44,19 +44,28 @@ async fn run() -> Result<()> {
 
 fn init_tracing(verbose: bool) -> Result<()> {
     let env_filter = if verbose {
-        EnvFilter::new("info")
+        EnvFilter::new("debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
 
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_target(false)
-        .without_time()
-        .try_init()
-        .map_err(|error| {
-            FagentError::Validation(format!("failed to initialize logging: {error}"))
-        })?;
+        .with_target(false);
+
+    let init_result = if verbose {
+        builder
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .try_init()
+    } else {
+        builder
+            .without_time()
+            .try_init()
+    };
+
+    init_result.map_err(|error| {
+        FagentError::Validation(format!("failed to initialize logging: {error}"))
+    })?;
 
     Ok(())
 }
