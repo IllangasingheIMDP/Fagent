@@ -5,7 +5,10 @@ Fagent is an AI-assisted filesystem agent written in Rust. It converts a natural
 It is designed for practical local file operations with strong guardrails:
 - Workspace jail by default (blocks path escape and traversal)
 - Human approval gate before execution
-- Action-by-action validation and fail-fast execution
+- Action-by-action validation and interactive execution recovery
+- Automatic rollback support to undo completed actions on failure
+- Windows file-lock detection and actionable troubleshooting guidance
+- In-terminal instruction re-planning without restarting upon failure
 - Soft delete by default (trash/recycle bin) unless you opt into permanent deletion
 
 ## What Fagent Can Do
@@ -36,23 +39,34 @@ Typical use cases:
 	 - Approve
 	 - Cancel
 	 - Edit instruction
-7. If approved, actions execute in order with fail-fast behavior.
+7. If approved, actions execute in order.
+8. If an action fails, you can interactively choose:
+	 - **Try again**: Retry starting from the failed action.
+	 - **Roll back**: Automatically undo completed actions in reverse order (LIFO).
+	 - **Abort**: Stop execution immediately without rollback.
+9. If execution does not complete, you can edit your instruction and re-plan in-place without exiting.
 
-## Safety Model
+## Safety Model & Error Recovery
 
-- Workspace jail: relative paths are resolved under the current working directory by default.
-- Escape protection: traversal and symlink escapes are blocked unless `--allow-global` is enabled.
-- Reserved name checks: Windows device names are rejected.
-- Plan consistency checks:
-	- required fields per action
-	- destination conflicts
-	- invalid action ordering
-- Deletion behavior:
-	- default: route deletes to OS trash/recycle bin
+- **Workspace jail**: Relative paths are resolved under the current working directory by default.
+- **Escape protection**: Traversal and symlink escapes are blocked unless `--allow-global` is enabled.
+- **Reserved name checks**: Windows device names are rejected.
+- **Plan consistency checks**:
+	- Required fields per action
+	- Destination conflicts
+	- Invalid action ordering
+- **Deletion behavior**:
+	- Default: route deletes to OS trash/recycle bin
 	- `--permanent-delete`: permanently remove files/directories
-	- workspace-root deletion is blocked
-	- repository metadata directories such as `.git` are protected from deletion
-	- risky deletes (permanent, recursive directory, outside-workspace) require extra confirmation
+	- Workspace-root deletion is blocked
+	- Repository metadata directories such as `.git` are protected from deletion
+	- Risky deletes (permanent, recursive directory, outside-workspace) require extra confirmation
+- **Smart Rollback & Recovery**:
+	- **Granular directory tracking**: Intermediate ancestor directories created during execution are tracked and cleaned up on rollback without affecting pre-existing folders.
+	- **Reversible actions**: Reverts file/directory creation, moves/renames (with cross-device fallback), zip creation, archive extraction, and restores from OS trash where supported.
+	- **Rollback error handling**: If a rollback step fails, choose to retry the step, skip it and continue rolling back remaining actions, or abort.
+	- **Permanent deletion protection**: Non-reversible actions are explicitly flagged during rollback.
+- **File-Lock Diagnostics**: Heuristically detects Windows file-lock conditions (OS error 32, 5, 33, sharing/lock violations) and suggests closing blocking applications or terminating processes before retrying.
 
 ## Supported Providers
 
@@ -64,7 +78,7 @@ Typical use cases:
 Default models:
 - OpenAI: `gpt-4.1-mini`
 - Anthropic: `claude-3-7-sonnet-latest`
-- Gemini: `gemini-2.5-flash`
+- Gemini: `gemini-3.5-flash-lite`
 - Ollama: `llama3.1:8b`
 
 ## Requirements
@@ -114,7 +128,7 @@ cargo run -- setup
 Setup flow:
 - Choose default provider
 - Choose default model
-- Enter API key (for non-Ollama providers)
+- Enter API key (for non-Ollama providers) with masked input and visibility toggle
 - API key is stored in OS keychain
 - Config is written to platform config directory
 
@@ -165,7 +179,7 @@ cargo run -- "create a file docs/hello.txt with content hello world"
 Use Gemini explicitly:
 
 ```bash
-cargo run -- --provider gemini --model gemini-2.5-flash "rename src/old.txt to src/new.txt"
+cargo run -- --provider gemini --model gemini-3.5-flash-lite "rename src/old.txt to src/new.txt"
 ```
 
 Use Ollama with a local model:
@@ -176,7 +190,7 @@ cargo run -- --provider ollama --model llama3.1:8b "create scripts/run.bat with 
 
 ## Logging and Sensitive Data
 
-- Use `--verbose` to enable info-level logs.
+- Use `--verbose` to enable `debug`-level logs with span lifecycle event tracking for execution timing.
 - Provider error mapping is sanitized to avoid leaking credential-bearing URLs in error messages.
 - If you add custom logs, avoid printing secrets from headers, environment variables, or keychain values.
 
@@ -201,11 +215,11 @@ src/
 	cli.rs        # clap CLI definitions
 	config.rs     # setup, config loading, keychain/env resolution
 	context.rs    # workspace scan and compact context JSON
-	executor.rs   # action execution engine
+	executor.rs   # action execution and rollback engine
 	llm/          # provider clients and prompt composition
 	plan.rs       # plan schema and validation
 	security.rs   # workspace jail and path safety
-	ui.rs         # interactive review and result output
+	ui.rs         # interactive review, recovery prompts, and result output
 	main.rs       # orchestration entry point
 ```
 
@@ -225,4 +239,4 @@ Contributions are welcome. Please open an issue or PR with:
 
 ## License
 
-No license file is currently included in this repository. 
+No license file is currently included in this repository.
