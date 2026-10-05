@@ -61,4 +61,23 @@ impl LlmProvider for OllamaProvider {
 
         parse_plan_response(content)
     }
+    async fn call(&self, request: &crate::llm::AgentRequest) -> Result<crate::llm::LlmResponse> {
+        let payload = json!({"model":request.model,"stream":false,"messages":crate::llm::openai_messages(&request.messages),"tools":request.tools.iter().map(|t|json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect::<Vec<_>>()});
+        let value: serde_json::Value = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| map_http_error("Ollama request", e))?
+            .error_for_status()
+            .map_err(|e| map_http_error("Ollama response status", e))?
+            .json()
+            .await
+            .map_err(|e| map_http_error("Ollama response decode", e))?;
+        let message = value.get("message").cloned().ok_or_else(|| {
+            FagentError::Provider("Ollama response did not include message".into())
+        })?;
+        crate::llm::parse_openai_response(&json!({"choices":[{"message":message}]}))
+    }
 }

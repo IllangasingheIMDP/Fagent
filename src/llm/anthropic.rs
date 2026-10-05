@@ -61,4 +61,61 @@ impl LlmProvider for AnthropicProvider {
 
         parse_plan_response(&content)
     }
+    async fn call(&self, request: &crate::llm::AgentRequest) -> Result<crate::llm::LlmResponse> {
+        let system = request
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let messages=request.messages.iter().filter(|m|m.role!="system").map(|m|json!({"role":if m.role=="assistant"{"assistant"}else{"user"},"content":m.content})).collect::<Vec<_>>();
+        let payload = json!({"model":request.model,"max_tokens":1800,"system":system,"messages":messages,"tools":request.tools.iter().map(|t|json!({"name":t.name,"description":t.description,"input_schema":t.parameters})).collect::<Vec<_>>()});
+        let value: serde_json::Value = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| map_http_error("Anthropic request", e))?
+            .error_for_status()
+            .map_err(|e| map_http_error("Anthropic response status", e))?
+            .json()
+            .await
+            .map_err(|e| map_http_error("Anthropic response decode", e))?;
+        if let Some(calls) = value
+            .get("content")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|p| p.get("type").and_then(|x| x.as_str()) == Some("tool_use"))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|a| !a.is_empty())
+        {
+            return Ok(crate::llm::LlmResponse::ToolCalls(
+                calls
+                    .into_iter()
+                    .map(|p| crate::llm::ToolCallRequest {
+                        id: p
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("tool-call")
+                            .into(),
+                        name: p
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .into(),
+                        params: p.get("input").cloned().unwrap_or_else(|| json!({})),
+                    })
+                    .collect(),
+            ));
+        }
+        Ok(crate::llm::LlmResponse::Message(
+            extract_text_from_content_array(value.get("content").unwrap_or(&json!([])))
+                .unwrap_or_default(),
+        ))
+    }
 }

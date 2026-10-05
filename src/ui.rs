@@ -4,12 +4,76 @@ use comfy_table::{Color, Table, presets::UTF8_FULL};
 use inquire::{Select, Text};
 
 use crate::executor::{
-    ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision,
-    RollbackActionReport, RollbackFailureDecision, RollbackReport, RollbackStatus,
-    is_file_locked_error,
+    ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision, RollbackActionReport,
+    RollbackFailureDecision, RollbackReport, RollbackStatus, is_file_locked_error,
 };
 use crate::plan::{EffectiveActionKind, ValidatedPlan};
+use crate::tools::ToolResult;
 use crate::{FagentError, Result};
+
+pub trait AgentUi: Send + Sync {
+    fn should_approve_stage(
+        &self,
+        name: &str,
+        objective: &str,
+        plan: &ValidatedPlan,
+    ) -> Result<bool>;
+    fn print_tool_result(&self, name: &str, result: &ToolResult);
+    fn print_stage_result(&self, name: &str, result: &ToolResult);
+    fn print_summary(&self, text: &str);
+    fn prompt_user(&self) -> Result<String>;
+    fn print_turn_header(&self, turn_index: usize);
+    fn print_message(&self, text: &str);
+}
+#[derive(Debug, Clone)]
+pub struct InteractiveAgentUi {
+    pub approval_mode: crate::cli::ApprovalMode,
+}
+impl InteractiveAgentUi {
+    pub fn new(approval_mode: crate::cli::ApprovalMode) -> Self {
+        Self { approval_mode }
+    }
+}
+impl AgentUi for InteractiveAgentUi {
+    fn should_approve_stage(
+        &self,
+        name: &str,
+        objective: &str,
+        plan: &ValidatedPlan,
+    ) -> Result<bool> {
+        if matches!(self.approval_mode, crate::cli::ApprovalMode::Auto) {
+            return Ok(true);
+        }
+        println!(
+            "\nStage: {name}\nObjective: {objective}\n\n{}",
+            render_plan_table(plan)
+        );
+        print_action_warnings(plan);
+        let answer = Text::new("Approve this stage? [y/N]").prompt()?;
+        Ok(matches!(
+            answer.to_ascii_lowercase().as_str(),
+            "y" | "yes" | "a" | "all"
+        ))
+    }
+    fn print_tool_result(&self, name: &str, result: &ToolResult) {
+        println!("{name}: {}", result.output)
+    }
+    fn print_stage_result(&self, name: &str, result: &ToolResult) {
+        println!("Stage `{name}`: {}", result.output)
+    }
+    fn print_summary(&self, text: &str) {
+        println!("\n{text}")
+    }
+    fn prompt_user(&self) -> Result<String> {
+        Ok(Text::new("Agent needs input:").prompt()?)
+    }
+    fn print_turn_header(&self, n: usize) {
+        println!("\n--- Agent turn {n} ---")
+    }
+    fn print_message(&self, text: &str) {
+        println!("{text}")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewChoice {
@@ -225,10 +289,7 @@ pub enum PostFailureChoice {
 
 pub fn prompt_post_failure_action(current_instruction: &str) -> Result<PostFailureChoice> {
     println!("\nExecution did not complete.");
-    let options = vec![
-        "Edit instruction and re-plan",
-        "Exit",
-    ];
+    let options = vec!["Edit instruction and re-plan", "Exit"];
     let choice = match Select::new("What would you like to do next?", options).prompt() {
         Ok(c) => c,
         Err(inquire::error::InquireError::OperationCanceled)
@@ -268,7 +329,9 @@ impl ExecutionRecoveryHandler for InteractiveRecoveryHandler {
 
         if is_file_locked_error(&context.error) {
             println!("💡 File Lock Detected: The file appears to be in use by another process.");
-            println!("   Please close applications using this file (or terminate the process in Task Manager),");
+            println!(
+                "   Please close applications using this file (or terminate the process in Task Manager),"
+            );
             println!("   then choose 'Try again'.\n");
         }
 
@@ -278,14 +341,15 @@ impl ExecutionRecoveryHandler for InteractiveRecoveryHandler {
         }
         options.push("Abort (stop execution without rollback)");
 
-        let choice = match Select::new("How would you like to handle this failure?", options).prompt() {
-            Ok(c) => c,
-            Err(inquire::error::InquireError::OperationCanceled)
-            | Err(inquire::error::InquireError::OperationInterrupted) => {
-                return Ok(RecoveryDecision::Abort);
-            }
-            Err(err) => return Err(FagentError::from(err)),
-        };
+        let choice =
+            match Select::new("How would you like to handle this failure?", options).prompt() {
+                Ok(c) => c,
+                Err(inquire::error::InquireError::OperationCanceled)
+                | Err(inquire::error::InquireError::OperationInterrupted) => {
+                    return Ok(RecoveryDecision::Abort);
+                }
+                Err(err) => return Err(FagentError::from(err)),
+            };
 
         match choice {
             c if c.starts_with("Try again") => Ok(RecoveryDecision::Retry),
@@ -308,11 +372,7 @@ impl ExecutionRecoveryHandler for InteractiveRecoveryHandler {
         }
     }
 
-    fn on_rollback_failure(
-        &self,
-        action_id: &str,
-        error: &str,
-    ) -> Result<RollbackFailureDecision> {
+    fn on_rollback_failure(&self, action_id: &str, error: &str) -> Result<RollbackFailureDecision> {
         println!("\n❌ Failed to roll back action '{action_id}': {error}");
         if is_file_locked_error(error) {
             println!("💡 Notice: The file appears to be locked by another process.");

@@ -102,7 +102,11 @@ impl ExecutionRecoveryHandler for NonInteractiveRecoveryHandler {
 
     fn on_rollback_step(&self, _report: &RollbackActionReport) {}
 
-    fn on_rollback_failure(&self, _action_id: &str, _error: &str) -> Result<RollbackFailureDecision> {
+    fn on_rollback_failure(
+        &self,
+        _action_id: &str,
+        _error: &str,
+    ) -> Result<RollbackFailureDecision> {
         Ok(RollbackFailureDecision::Skip)
     }
 }
@@ -150,14 +154,11 @@ impl Executor {
     }
 
     pub async fn run(&self, plan: &ValidatedPlan) -> ExecutionReport {
-        self.run_with_recovery(plan, &NonInteractiveRecoveryHandler).await
+        self.run_with_recovery(plan, &NonInteractiveRecoveryHandler)
+            .await
     }
 
-    pub async fn run_with_recovery<H>(
-        &self,
-        plan: &ValidatedPlan,
-        handler: &H,
-    ) -> ExecutionReport
+    pub async fn run_with_recovery<H>(&self, plan: &ValidatedPlan, handler: &H) -> ExecutionReport
     where
         H: ExecutionRecoveryHandler,
     {
@@ -255,10 +256,7 @@ impl Executor {
         }
     }
 
-    pub async fn rollback(
-        &self,
-        completed_records: &[ExecutedActionRecord],
-    ) -> RollbackReport {
+    pub async fn rollback(&self, completed_records: &[ExecutedActionRecord]) -> RollbackReport {
         self.rollback_records(completed_records, &NonInteractiveRecoveryHandler)
             .await
     }
@@ -337,10 +335,7 @@ impl Executor {
         }
     }
 
-    pub async fn execute_action(
-        &self,
-        action: &ValidatedAction,
-    ) -> Result<ExecutedActionRecord> {
+    pub async fn execute_action(&self, action: &ValidatedAction) -> Result<ExecutedActionRecord> {
         let mut record = match action.effective_kind {
             EffectiveActionKind::CreateDir => {
                 self.create_dir(action.destination.as_ref().expect("validated"))
@@ -475,10 +470,7 @@ impl Executor {
                     }
                 }
 
-                RollbackStatus::Success(format!(
-                    "deleted created file `{}`",
-                    destination.display()
-                ))
+                RollbackStatus::Success(format!("deleted created file `{}`", destination.display()))
             }
             EffectiveActionKind::CreateDir => {
                 for dir in &record.created_dirs {
@@ -491,9 +483,7 @@ impl Executor {
                     .as_deref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                RollbackStatus::Success(format!(
-                    "removed created directory `{dest_display}`"
-                ))
+                RollbackStatus::Success(format!("removed created directory `{dest_display}`"))
             }
             EffectiveActionKind::MoveFile | EffectiveActionKind::RenamePath => {
                 let source = match &record.source {
@@ -533,8 +523,9 @@ impl Executor {
                 match fs::rename(destination, source).await {
                     Ok(()) => {}
                     Err(err) if is_cross_device_error(&err) => {
-                        if let Err(e) =
-                            self.copy_then_remove(destination.clone(), source.clone()).await
+                        if let Err(e) = self
+                            .copy_then_remove(destination.clone(), source.clone())
+                            .await
                         {
                             return RollbackStatus::Failed(format!(
                                 "failed to move `{}` back to `{}` across devices: {e}",
@@ -589,10 +580,7 @@ impl Executor {
                     }
                 }
 
-                RollbackStatus::Success(format!(
-                    "deleted zip archive `{}`",
-                    destination.display()
-                ))
+                RollbackStatus::Success(format!("deleted zip archive `{}`", destination.display()))
             }
             EffectiveActionKind::UnzipArchive => {
                 if let Some(artifacts) = &record.extracted_artifacts {
@@ -619,9 +607,7 @@ impl Executor {
                     .as_deref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                RollbackStatus::Success(format!(
-                    "removed extracted files from `{dest_display}`"
-                ))
+                RollbackStatus::Success(format!("removed extracted files from `{dest_display}`"))
             }
         }
     }
@@ -734,10 +720,9 @@ impl Executor {
 
         let source_for_zip = source.to_path_buf();
         let destination_buf = destination.to_path_buf();
-        let result = tokio::task::spawn_blocking(move || {
-            zip_path_sync(&source_for_zip, &destination_buf)
-        })
-        .await?;
+        let result =
+            tokio::task::spawn_blocking(move || zip_path_sync(&source_for_zip, &destination_buf))
+                .await?;
 
         if let Err(err) = result {
             if destination.exists() {
@@ -965,7 +950,9 @@ fn add_path_to_zip(
 ) -> Result<()> {
     if path.is_dir() {
         let relative = path.strip_prefix(base).map_err(|error| {
-            FagentError::Execution(format!("zip failed while building directory entry: {error}"))
+            FagentError::Execution(format!(
+                "zip failed while building directory entry: {error}"
+            ))
         })?;
         let archive_path = if relative.as_os_str().is_empty() {
             PathBuf::from(root_name)
@@ -1006,7 +993,9 @@ fn add_file_to_zip(
             entry_name,
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated),
         )
-        .map_err(|error| FagentError::Execution(format!("zip failed while adding file: {error}")))?;
+        .map_err(|error| {
+            FagentError::Execution(format!("zip failed while adding file: {error}"))
+        })?;
 
     let mut input = std::fs::File::open(source)?;
     let mut buffer = Vec::new();
@@ -1032,8 +1021,9 @@ fn unzip_archive_sync_with_limits(
 
     let res = (|| -> Result<()> {
         let input = std::fs::File::open(source)?;
-        let mut archive = zip::ZipArchive::new(input)
-            .map_err(|error| FagentError::Execution(format!("unzip failed to open archive: {error}")))?;
+        let mut archive = zip::ZipArchive::new(input).map_err(|error| {
+            FagentError::Execution(format!("unzip failed to open archive: {error}"))
+        })?;
 
         if archive.len() > limits.max_entries {
             return Err(FagentError::Execution(format!(
@@ -1098,12 +1088,15 @@ fn unzip_archive_sync_with_limits(
                 )));
             }
 
-            let enclosed = entry.enclosed_name().map(|path| path.to_path_buf()).ok_or_else(|| {
-                FagentError::Execution(format!(
-                    "unzip rejected unsafe archive entry path: {}",
-                    entry.name()
-                ))
-            })?;
+            let enclosed = entry
+                .enclosed_name()
+                .map(|path| path.to_path_buf())
+                .ok_or_else(|| {
+                    FagentError::Execution(format!(
+                        "unzip rejected unsafe archive entry path: {}",
+                        entry.name()
+                    ))
+                })?;
             if enclosed.components().count() > limits.max_path_depth {
                 return Err(FagentError::Execution(format!(
                     "unzip rejected deep archive path for {} (depth limit={})",
@@ -1143,13 +1136,14 @@ fn unzip_archive_sync_with_limits(
             artifacts.extracted_files.push(output.clone());
 
             total_uncompressed = total_uncompressed.checked_add(written).ok_or_else(|| {
-                FagentError::Execution("unzip rejected archive because extracted size overflowed".into())
+                FagentError::Execution(
+                    "unzip rejected archive because extracted size overflowed".into(),
+                )
             })?;
             if total_uncompressed > limits.max_total_uncompressed_bytes {
                 return Err(FagentError::Execution(format!(
                     "unzip rejected archive because total extracted size exceeds limit: {} > {}",
-                    total_uncompressed,
-                    limits.max_total_uncompressed_bytes
+                    total_uncompressed, limits.max_total_uncompressed_bytes
                 )));
             }
 
@@ -1535,12 +1529,16 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("total extracted size exceeds limit"));
+        assert!(
+            error
+                .to_string()
+                .contains("total extracted size exceeds limit")
+        );
     }
 
     use super::{
-        ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision,
-        RollbackActionReport, RollbackStatus, is_file_locked_error,
+        ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision, RollbackActionReport,
+        RollbackStatus, is_file_locked_error,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1949,11 +1947,15 @@ mod tests {
 
     #[test]
     fn test_is_file_locked_error() {
-        assert!(is_file_locked_error("The process cannot access the file because it is being used by another process. (os error 32)"));
+        assert!(is_file_locked_error(
+            "The process cannot access the file because it is being used by another process. (os error 32)"
+        ));
         assert!(is_file_locked_error("Access is denied. (os error 5)"));
         assert!(is_file_locked_error("sharing violation"));
         assert!(is_file_locked_error("lock violation"));
         assert!(is_file_locked_error("os error 33"));
-        assert!(!is_file_locked_error("No such file or directory (os error 2)"));
+        assert!(!is_file_locked_error(
+            "No such file or directory (os error 2)"
+        ));
     }
 }
