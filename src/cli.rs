@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::ProviderKind;
 
@@ -27,6 +27,13 @@ pub struct Cli {
     pub scan_depth: usize,
 
     #[arg(long, global = true, default_value_t = false)]
+    pub agent: bool,
+    #[arg(long, global = true, default_value_t = 30)]
+    pub max_turns: usize,
+    #[arg(long, global = true, value_enum, default_value_t = ApprovalMode::PerRiskyTool)]
+    pub approval_mode: ApprovalMode,
+
+    #[arg(long, global = true, default_value_t = false)]
     pub allow_global: bool,
 
     #[arg(long, global = true, default_value_t = false)]
@@ -34,6 +41,13 @@ pub struct Cli {
 
     #[arg(long, short, global = true, default_value_t = false)]
     pub verbose: bool,
+}
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum ApprovalMode {
+    Auto,
+    PerTool,
+    PerSession,
+    PerRiskyTool,
 }
 
 #[derive(Debug, Clone, Subcommand)]

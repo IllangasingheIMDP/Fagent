@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::config::{ProviderKind, ResolvedConfig};
 use crate::plan::ExecutionPlan;
+use crate::tools::ToolSpec;
 use crate::{FagentError, Result};
 
 pub use anthropic::AnthropicProvider;
@@ -50,6 +51,118 @@ impl PlanRequest {
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn plan(&self, request: &PlanRequest) -> Result<ExecutionPlan>;
+    async fn call(&self, request: &AgentRequest) -> Result<LlmResponse>;
+}
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub is_error: bool,
+}
+impl Message {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            content: content.into(),
+            tool_name: None,
+            is_error: false,
+        }
+    }
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            tool_name: None,
+            is_error: false,
+        }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_name: None,
+            is_error: false,
+        }
+    }
+    pub fn tool(name: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_name: Some(name.into()),
+            is_error,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct AgentRequest {
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSpec>,
+    pub model: String,
+}
+#[derive(Debug, Clone)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub params: serde_json::Value,
+}
+#[derive(Debug, Clone)]
+pub enum LlmResponse {
+    ToolCalls(Vec<ToolCallRequest>),
+    TaskComplete { summary: String },
+    Message(String),
+}
+pub(crate) fn openai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.role == "tool" {
+                serde_json::json!({"role":"tool","name":m.tool_name,"content":m.content})
+            } else {
+                serde_json::json!({"role":m.role,"content":m.content})
+            }
+        })
+        .collect()
+}
+pub(crate) fn parse_openai_response(value: &serde_json::Value) -> Result<LlmResponse> {
+    let m = value
+        .get("choices")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("message"))
+        .ok_or_else(|| {
+            FagentError::Provider("provider response did not include a message".into())
+        })?;
+    if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        let calls = calls
+            .iter()
+            .map(|c| {
+                let f = c.get("function").unwrap_or(c);
+                Ok(ToolCallRequest {
+                    id: c
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool-call")
+                        .into(),
+                    name: f
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| FagentError::Provider("tool call is missing name".into()))?
+                        .into(),
+                    params: serde_json::from_str(
+                        f.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}"),
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(LlmResponse::ToolCalls(calls));
+    }
+    Ok(LlmResponse::Message(
+        m.get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .into(),
+    ))
 }
 
 pub fn build_provider(config: &ResolvedConfig) -> Result<Box<dyn LlmProvider>> {

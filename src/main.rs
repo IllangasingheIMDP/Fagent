@@ -39,7 +39,25 @@ async fn run() -> Result<()> {
     let workspace_root = std::env::current_dir()?;
     let policy = WorkspacePolicy::new(workspace_root, cli.allow_global, cli.permanent_delete)?;
 
-    run_instruction_loop(instruction, cli.scan_depth, runtime, policy).await
+    if cli.agent {
+        let model = runtime.model.clone();
+        let mut agent = fagent::agent::Agent::new(
+            llm::build_provider(&runtime)?,
+            instruction,
+            policy,
+            model,
+            fagent::agent::AgentConfig {
+                max_turns: cli.max_turns,
+                max_tool_retries: 1,
+            },
+        );
+        agent
+            .run(&ui::InteractiveAgentUi::new(cli.approval_mode))
+            .await?;
+        Ok(())
+    } else {
+        run_instruction_loop(instruction, cli.scan_depth, runtime, policy).await
+    }
 }
 
 fn init_tracing(verbose: bool) -> Result<()> {
@@ -58,9 +76,7 @@ fn init_tracing(verbose: bool) -> Result<()> {
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
             .try_init()
     } else {
-        builder
-            .without_time()
-            .try_init()
+        builder.without_time().try_init()
     };
 
     init_result.map_err(|error| {

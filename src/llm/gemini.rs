@@ -80,4 +80,56 @@ impl LlmProvider for GeminiProvider {
 
         parse_plan_response(content)
     }
+    async fn call(&self, request: &crate::llm::AgentRequest) -> Result<crate::llm::LlmResponse> {
+        let endpoint = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            request.model
+        );
+        let contents=request.messages.iter().filter(|m|m.role!="system").map(|m|json!({"role":if m.role=="assistant"{"model"}else{"user"},"parts":[{"text":m.content}]})).collect::<Vec<_>>();
+        let system = request
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let payload = json!({"systemInstruction":{"parts":[{"text":system}]},"contents":contents,"tools":[{"functionDeclarations":request.tools.iter().map(|t|json!({"name":t.name,"description":t.description,"parameters":t.parameters})).collect::<Vec<_>>()}]});
+        let value: serde_json::Value = self
+            .client
+            .post(endpoint)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| map_http_error("Gemini request", e))?
+            .error_for_status()
+            .map_err(|e| map_http_error("Gemini response status", e))?
+            .json()
+            .await
+            .map_err(|e| map_http_error("Gemini response decode", e))?;
+        let parts = value
+            .pointer("/candidates/0/content/parts")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                FagentError::Provider("Gemini response did not include content".into())
+            })?;
+        if let Some(fc) = parts.iter().find_map(|p| p.get("functionCall")) {
+            return Ok(crate::llm::LlmResponse::ToolCalls(vec![
+                crate::llm::ToolCallRequest {
+                    id: "tool-call".into(),
+                    name: fc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .into(),
+                    params: fc.get("args").cloned().unwrap_or_else(|| json!({})),
+                },
+            ]));
+        }
+        Ok(crate::llm::LlmResponse::Message(
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                .collect(),
+        ))
+    }
 }
