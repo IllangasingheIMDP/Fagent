@@ -65,6 +65,13 @@ impl AgentMemory {
         });
         self.trim();
     }
+    pub fn push_assistant_message(&mut self, text: String) {
+        self.turns.push(Turn {
+            role: TurnRole::Assistant,
+            content: TurnContent::Text(text),
+        });
+        self.trim();
+    }
     pub fn push_tool_call(&mut self, name: String, params: serde_json::Value) {
         self.turns.push(Turn {
             role: TurnRole::Assistant,
@@ -83,7 +90,7 @@ impl AgentMemory {
     pub fn messages(&self) -> Vec<Message> {
         let mut messages = vec![
             Message::system(
-                "You are Fagent, a careful filesystem agent. Use tools to inspect before modifying. Call task_complete only when the goal is complete.",
+                "You are Fagent, a careful staged filesystem agent. First inspect the environment and identify constraints, ambiguity, and information needed to safely fulfill the goal. Use only list_directory, read_file, and search_paths while gathering evidence; their results are automatically observed. Then submit one coherent ordered batch with execute_stage for the next stage. A stage contains all dependent filesystem actions that can safely be executed together, not one action per stage. The user approves each execute_stage batch once. After every stage, use observations to plan the next stage. Do not call filesystem mutation tools directly; execute_stage is the only mutation route. Call task_complete only when the goal is complete.",
             ),
             Message::user(self.goal.clone()),
         ];

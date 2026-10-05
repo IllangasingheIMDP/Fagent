@@ -113,6 +113,23 @@ pub enum LlmResponse {
     TaskComplete { summary: String },
     Message(String),
 }
+
+pub fn stage_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "execute_stage".into(),
+        description: "Submit one coherent, ordered filesystem stage for approval and execution. Use discovery tools first when information is missing. Do not submit a stage until its actions are complete and internally consistent.".into(),
+        parameters: serde_json::json!({
+            "type":"object", "required":["name", "objective", "actions"],
+            "properties": {
+                "name":{"type":"string"}, "objective":{"type":"string"},
+                "actions":{"type":"array", "minItems":1, "items":{"type":"object", "required":["kind"], "properties":{
+                    "kind":{"type":"string","enum":["create_dir","create_file","move_file","rename_path","zip_path","unzip_archive","delete_path"]},
+                    "source":{"type":"string"}, "destination":{"type":"string"}, "content":{"type":"string"}, "rationale":{"type":"string"}
+                }}}
+            }
+        }),
+    }
+}
 pub(crate) fn openai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
         .iter()

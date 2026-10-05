@@ -7,14 +7,19 @@ use crate::executor::{
     ExecutionFailureContext, ExecutionRecoveryHandler, RecoveryDecision, RollbackActionReport,
     RollbackFailureDecision, RollbackReport, RollbackStatus, is_file_locked_error,
 };
-use crate::llm::ToolCallRequest;
 use crate::plan::{EffectiveActionKind, ValidatedPlan};
 use crate::tools::ToolResult;
 use crate::{FagentError, Result};
 
 pub trait AgentUi: Send + Sync {
-    fn should_approve(&self, call: &ToolCallRequest) -> Result<bool>;
+    fn should_approve_stage(
+        &self,
+        name: &str,
+        objective: &str,
+        plan: &ValidatedPlan,
+    ) -> Result<bool>;
     fn print_tool_result(&self, name: &str, result: &ToolResult);
+    fn print_stage_result(&self, name: &str, result: &ToolResult);
     fn print_summary(&self, text: &str);
     fn prompt_user(&self) -> Result<String>;
     fn print_turn_header(&self, turn_index: usize);
@@ -30,12 +35,21 @@ impl InteractiveAgentUi {
     }
 }
 impl AgentUi for InteractiveAgentUi {
-    fn should_approve(&self, call: &ToolCallRequest) -> Result<bool> {
+    fn should_approve_stage(
+        &self,
+        name: &str,
+        objective: &str,
+        plan: &ValidatedPlan,
+    ) -> Result<bool> {
         if matches!(self.approval_mode, crate::cli::ApprovalMode::Auto) {
             return Ok(true);
-        };
-        println!("\nTool {}: {}", call.name, call.params);
-        let answer = Text::new("Approve? [y/N]").prompt()?;
+        }
+        println!(
+            "\nStage: {name}\nObjective: {objective}\n\n{}",
+            render_plan_table(plan)
+        );
+        print_action_warnings(plan);
+        let answer = Text::new("Approve this stage? [y/N]").prompt()?;
         Ok(matches!(
             answer.to_ascii_lowercase().as_str(),
             "y" | "yes" | "a" | "all"
@@ -43,6 +57,9 @@ impl AgentUi for InteractiveAgentUi {
     }
     fn print_tool_result(&self, name: &str, result: &ToolResult) {
         println!("{name}: {}", result.output)
+    }
+    fn print_stage_result(&self, name: &str, result: &ToolResult) {
+        println!("Stage `{name}`: {}", result.output)
     }
     fn print_summary(&self, text: &str) {
         println!("\n{text}")

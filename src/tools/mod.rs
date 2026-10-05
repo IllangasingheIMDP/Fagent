@@ -64,6 +64,17 @@ impl ToolRegistry {
             })
             .collect()
     }
+    pub fn specs_named(&self, names: &[&str]) -> Vec<ToolSpec> {
+        self.tools
+            .values()
+            .filter(|tool| names.contains(&tool.name()))
+            .map(|tool| ToolSpec {
+                name: tool.name().into(),
+                description: tool.description().into(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
     pub async fn call(
         &self,
         name: &str,
