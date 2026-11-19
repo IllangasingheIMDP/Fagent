@@ -125,9 +125,7 @@ pub fn validate_plan(plan: ExecutionPlan, policy: &WorkspacePolicy) -> Result<Va
                 EffectiveActionKind::RenamePath,
                 false,
             )?,
-            ActionKind::ZipPath => {
-                validate_zip_path(action, policy, &mut available, &mut removed)?
-            }
+            ActionKind::ZipPath => validate_zip_path(action, policy, &mut available, &mut removed)?,
             ActionKind::UnzipArchive => {
                 validate_unzip_archive(action, policy, &mut available, &mut removed)?
             }
@@ -838,6 +836,10 @@ mod tests {
         };
 
         let error = validate_plan(plan, &policy).unwrap_err();
-        assert!(error.to_string().contains("cannot be inside the source directory"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be inside the source directory")
+        );
     }
 }

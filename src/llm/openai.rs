@@ -63,4 +63,21 @@ impl LlmProvider for OpenAiProvider {
 
         parse_plan_response(content)
     }
+    async fn call(&self, request: &crate::llm::AgentRequest) -> Result<crate::llm::LlmResponse> {
+        let payload = json!({"model":request.model,"temperature":0,"messages":crate::llm::openai_messages(&request.messages),"tools":request.tools.iter().map(|t|json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect::<Vec<_>>()});
+        let value: serde_json::Value = self
+            .client
+            .post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| map_http_error("OpenAI request", e))?
+            .error_for_status()
+            .map_err(|e| map_http_error("OpenAI response status", e))?
+            .json()
+            .await
+            .map_err(|e| map_http_error("OpenAI response decode", e))?;
+        crate::llm::parse_openai_response(&value)
+    }
 }

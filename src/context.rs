@@ -34,6 +34,10 @@ pub enum EntryKind {
 }
 
 pub fn scan_workspace(root: &Path, depth: usize) -> Result<DirectoryContext> {
+    list_directory(root, depth)
+}
+
+pub fn list_directory(root: &Path, depth: usize) -> Result<DirectoryContext> {
     let mut entries = Vec::new();
     for entry in WalkDir::new(root)
         .max_depth(depth.saturating_add(1))
@@ -88,6 +92,25 @@ pub fn scan_workspace(root: &Path, depth: usize) -> Result<DirectoryContext> {
     };
     context.truncate_to_limits()?;
     Ok(context)
+}
+
+#[derive(Debug, Default)]
+pub struct ContextCache {
+    entries: std::collections::HashMap<std::path::PathBuf, DirectoryContext>,
+}
+impl ContextCache {
+    pub fn get_or_scan(&mut self, path: &Path, depth: usize) -> Result<DirectoryContext> {
+        if let Some(value) = self.entries.get(path) {
+            return Ok(value.clone());
+        }
+        let value = list_directory(path, depth)?;
+        self.entries.insert(path.to_path_buf(), value.clone());
+        Ok(value)
+    }
+    pub fn invalidate_path(&mut self, path: &Path) {
+        self.entries
+            .retain(|key, _| !path.starts_with(key) && !key.starts_with(path));
+    }
 }
 
 fn infer_hint(path: &Path) -> Option<String> {
