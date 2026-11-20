@@ -190,6 +190,12 @@ pub fn build_provider(config: &ResolvedConfig) -> Result<Box<dyn LlmProvider>> {
                 .clone()
                 .ok_or_else(|| FagentError::Config("missing OpenAI API key".into()))?,
         ))),
+        ProviderKind::Groq => Ok(Box::new(OpenAiProvider::new_groq(
+            config
+                .api_key
+                .clone()
+                .ok_or_else(|| FagentError::Config("missing Groq API key".into()))?,
+        ))),
         ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::new(
             config
                 .api_key

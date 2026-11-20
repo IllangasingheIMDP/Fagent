@@ -7,6 +7,7 @@ use figment::{
     Figment,
     providers::{Format, Serialized, Toml},
 };
+use inquire::validator::Validation;
 use inquire::{Password, PasswordDisplayMode, Select, Text};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ const SERVICE_NAME: &str = "fagent";
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     OpenAi,
+    Groq,
     Anthropic,
     Gemini,
     Ollama,
@@ -28,6 +30,7 @@ impl ProviderKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::OpenAi => "OpenAI",
+            Self::Groq => "Groq",
             Self::Anthropic => "Anthropic",
             Self::Gemini => "Gemini",
             Self::Ollama => "Ollama",
@@ -37,6 +40,7 @@ impl ProviderKind {
     pub fn keychain_account(&self) -> &'static str {
         match self {
             Self::OpenAi => "openai_api_key",
+            Self::Groq => "groq_api_key",
             Self::Anthropic => "anthropic_api_key",
             Self::Gemini => "gemini_api_key",
             Self::Ollama => "ollama_api_key",
@@ -46,6 +50,7 @@ impl ProviderKind {
     pub fn env_var(&self) -> Option<&'static str> {
         match self {
             Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::Groq => Some("GROQ_API_KEY"),
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Gemini => Some("GEMINI_API_KEY"),
             Self::Ollama => None,
@@ -55,6 +60,7 @@ impl ProviderKind {
     pub fn default_model(&self) -> &'static str {
         match self {
             Self::OpenAi => "gpt-4.1-mini",
+            Self::Groq => "openai/gpt-oss-120b",
             Self::Anthropic => "claude-3-7-sonnet-latest",
             Self::Gemini => "gemini-3.5-flash-lite",
             Self::Ollama => "llama3.1:8b",
@@ -83,6 +89,7 @@ pub fn run_setup() -> Result<()> {
         "Select a default provider:",
         vec![
             ProviderKind::OpenAi,
+            ProviderKind::Groq,
             ProviderKind::Anthropic,
             ProviderKind::Gemini,
             ProviderKind::Ollama,
@@ -106,11 +113,7 @@ pub fn run_setup() -> Result<()> {
             .prompt()?;
         config.ollama_base_url = Some(ollama_base_url);
     } else {
-        let api_key = Password::new("Provider API key (stored in the OS keychain):")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .with_display_toggle_enabled()
-            .without_confirmation()
-            .prompt()?;
+        let api_key = api_key_prompt().prompt()?;
         store_api_key(&provider, &api_key)?;
     }
 
@@ -119,17 +122,57 @@ pub fn run_setup() -> Result<()> {
     Ok(())
 }
 
+fn api_key_prompt() -> Password<'static> {
+    Password::new("Provider API key (stored in the OS keychain):")
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .with_display_toggle_enabled()
+        .with_help_message(
+            "One * per character. Press Ctrl+R to show/hide and check pasted content.",
+        )
+        .with_formatter(&|input| "*".repeat(input.chars().count()))
+        .with_validator(|input: &str| {
+            Ok(if input.is_empty() {
+                Validation::Invalid("Enter an API key.".into())
+            } else if input.chars().any(char::is_whitespace) {
+                Validation::Invalid(
+                    "API keys cannot contain whitespace. Check the pasted content.".into(),
+                )
+            } else {
+                Validation::Valid
+            })
+        })
+        .without_confirmation()
+}
+
+fn resolve_provider_model(
+    cli_provider: Option<ProviderKind>,
+    cli_model: Option<String>,
+    config: &FileConfig,
+) -> (ProviderKind, String) {
+    let provider = cli_provider
+        .or_else(|| config.default_provider.clone())
+        .unwrap_or(ProviderKind::OpenAi);
+    let model = cli_model
+        .or_else(|| {
+            // A saved model belongs to its saved provider, not a CLI override.
+            (config
+                .default_provider
+                .as_ref()
+                .unwrap_or(&ProviderKind::OpenAi)
+                == &provider)
+                .then(|| config.default_model.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| provider.default_model().to_string());
+    (provider, model)
+}
+
 pub fn resolve_runtime(
     cli_provider: Option<ProviderKind>,
     cli_model: Option<String>,
 ) -> Result<ResolvedConfig> {
     let (file_config, config_path) = load_file_config()?;
-    let provider = cli_provider
-        .or(file_config.default_provider)
-        .unwrap_or(ProviderKind::OpenAi);
-    let model = cli_model
-        .or(file_config.default_model)
-        .unwrap_or_else(|| provider.default_model().to_string());
+    let (provider, model) = resolve_provider_model(cli_provider, cli_model, &file_config);
     let ollama_base_url = file_config
         .ollama_base_url
         .or_else(|| env::var("OLLAMA_BASE_URL").ok())
@@ -244,5 +287,62 @@ fn default_ollama_base_url() -> String {
 impl std::fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groq_override_uses_its_own_default_model() {
+        let config = FileConfig {
+            default_provider: Some(ProviderKind::OpenAi),
+            default_model: Some("saved-openai-model".into()),
+            ..Default::default()
+        };
+        let (provider, model) = resolve_provider_model(Some(ProviderKind::Groq), None, &config);
+        assert_eq!(provider, ProviderKind::Groq);
+        assert_eq!(model, "openai/gpt-oss-120b");
+        let (_, model) = resolve_provider_model(None, None, &config);
+        assert_eq!(model, "saved-openai-model");
+        let (_, model) =
+            resolve_provider_model(Some(ProviderKind::Groq), Some("custom".into()), &config);
+        assert_eq!(model, "custom");
+    }
+
+    #[test]
+    fn groq_config_round_trips() {
+        let config = FileConfig {
+            default_provider: Some(ProviderKind::Groq),
+            default_model: Some(ProviderKind::Groq.default_model().into()),
+            ..Default::default()
+        };
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: FileConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.default_provider, config.default_provider);
+        assert_eq!(loaded.default_model, config.default_model);
+        assert_eq!(ProviderKind::Groq.env_var(), Some("GROQ_API_KEY"));
+        assert_eq!(ProviderKind::Groq.keychain_account(), "groq_api_key");
+    }
+
+    #[test]
+    fn api_key_prompt_masks_actual_length_and_validates_input() {
+        let prompt = api_key_prompt();
+        assert_eq!(prompt.display_mode, PasswordDisplayMode::Masked);
+        assert_eq!(prompt.render_config.password_mask, '*');
+        for input in ["", "x", "test-api-key", "é🔑"] {
+            assert_eq!((prompt.formatter)(input), "*".repeat(input.chars().count()));
+        }
+        for input in ["", "   ", "key with spaces", "key\n", "\tkey"] {
+            assert!(matches!(
+                prompt.validators[0].validate(input).unwrap(),
+                Validation::Invalid(_)
+            ));
+        }
+        assert!(matches!(
+            prompt.validators[0].validate("test-api-key").unwrap(),
+            Validation::Valid
+        ));
     }
 }

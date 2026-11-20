@@ -71,12 +71,14 @@ Typical use cases:
 ## Supported Providers
 
 - OpenAI
+- Groq
 - Anthropic
 - Gemini
 - Ollama
 
 Default models:
 - OpenAI: `gpt-4.1-mini`
+- Groq: `openai/gpt-oss-120b`
 - Anthropic: `claude-3-7-sonnet-latest`
 - Gemini: `gemini-3.5-flash-lite`
 - Ollama: `llama3.1:8b`
@@ -128,7 +130,7 @@ cargo run -- setup
 Setup flow:
 - Choose default provider
 - Choose default model
-- Enter API key (for non-Ollama providers) with masked input and visibility toggle
+- Enter API key (for non-Ollama providers) with one `*` per character while typing/pasting and after submission; press `Ctrl+R` to show/hide the key and check pasted content. Empty keys and keys containing whitespace are rejected.
 - API key is stored in OS keychain
 - Config is written to platform config directory
 
@@ -144,6 +146,7 @@ For cloud providers, Fagent resolves API keys in this order:
 
 Environment variables:
 - OpenAI: `OPENAI_API_KEY`
+- Groq: `GROQ_API_KEY`
 - Anthropic: `ANTHROPIC_API_KEY`
 - Gemini: `GEMINI_API_KEY`
 - Ollama base URL: `OLLAMA_BASE_URL` (default: `http://127.0.0.1:11434`)
@@ -161,7 +164,7 @@ fagent setup
 ```
 
 Options:
-- `--provider <openai|anthropic|gemini|ollama>`
+- `--provider <openai|groq|anthropic|gemini|ollama>`
 - `--model <MODEL>`
 - `--scan-depth <N>` (default: `1`)
 - `--allow-global`
@@ -180,6 +183,12 @@ Use Gemini explicitly:
 
 ```bash
 cargo run -- --provider gemini --model gemini-3.5-flash-lite "rename src/old.txt to src/new.txt"
+```
+
+Use Groq with its default `openai/gpt-oss-120b` model (set `GROQ_API_KEY` or save a key with setup):
+
+```bash
+cargo run -- --provider groq "organize reports"
 ```
 
 Use Ollama with a local model:

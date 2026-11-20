@@ -71,4 +71,10 @@ mod tests {
         let cli = Cli::parse_from(["fagent", "--scan-depth", "4", "organize reports"]);
         assert_eq!(cli.scan_depth, 4);
     }
+
+    #[test]
+    fn accepts_groq_provider() {
+        let cli = Cli::parse_from(["fagent", "--provider", "groq", "organize reports"]);
+        assert_eq!(cli.provider, Some(crate::config::ProviderKind::Groq));
+    }
 }
